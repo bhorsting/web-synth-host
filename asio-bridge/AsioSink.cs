@@ -9,7 +9,11 @@ class CircularBuffer {
     private int count = 0;
     private readonly object lockObj = new object();
 
-    public CircularBuffer(int capacity) {
+    // 256 samples stereo Float32 = 256 * 2 * 4 = 2048 bytes = ~4.26ms
+    // Clamping to 2048 bytes ensures the buffer NEVER exceeds 4.2ms of backlog!
+    private readonly int maxCapacity = 2048;
+
+    public CircularBuffer(int capacity = 16384) {
         buffer = new byte[capacity];
     }
 
@@ -18,11 +22,13 @@ class CircularBuffer {
             for (int i = 0; i < length; i++) {
                 buffer[writePos] = data[offset + i];
                 writePos = (writePos + 1) % buffer.Length;
-                if (count < buffer.Length) {
-                    count++;
-                } else {
-                    readPos = (readPos + 1) % buffer.Length;
-                }
+                count++;
+            }
+
+            // Real-time latency clamp: drop stale ahead-of-time silence
+            if (count > maxCapacity) {
+                readPos = (writePos - maxCapacity + buffer.Length) % buffer.Length;
+                count = maxCapacity;
             }
         }
     }
@@ -71,19 +77,19 @@ class Program {
         }
 
         try {
-            var ring = new CircularBuffer(48000 * 2 * 4); // 1-second circular buffer
+            var ring = new CircularBuffer();
             var provider = new AsioStreamProvider(sampleRate, ring);
 
             using (var asio = new AsioOut(driverName)) {
                 asio.Init(provider);
                 asio.Play();
 
-                // Announce ready to parent process
+                // Notify parent Electron process
                 Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":channels=" + asio.DriverOutputChannelCount);
                 Console.Out.Flush();
 
                 using (var stdin = Console.OpenStandardInput()) {
-                    byte[] readBuf = new byte[2048];
+                    byte[] readBuf = new byte[1024]; // 1 block of 128 samples
                     int bytesRead;
                     while ((bytesRead = stdin.Read(readBuf, 0, readBuf.Length)) > 0) {
                         ring.Write(readBuf, 0, bytesRead);

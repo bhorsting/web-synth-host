@@ -78,6 +78,17 @@ if (OriginalAudioContext) {
         console.error('[SynthHost] Failed to load AudioWorklet module:', err);
       });
 
+      try {
+        Object.defineProperty(this, 'baseLatency', {
+          get: () => 128 / (this.sampleRate || 48000),
+          configurable: true
+        });
+        Object.defineProperty(this, 'outputLatency', {
+          get: () => (asioStatus.ready ? asioStatus.latencySamples : 64) / (this.sampleRate || 48000),
+          configurable: true
+        });
+      } catch (e) {}
+
       this.addEventListener('statechange', () => {
         updateHUD();
       });
