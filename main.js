@@ -11,6 +11,10 @@ app.commandLine.appendSwitch('disable-audio-output-resampler');
 app.commandLine.appendSwitch('enable-web-midi');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// Standard Chrome User-Agent to allow Google Identity Services / OAuth without disallowed_useragent block
+const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+app.userAgentFallback = CHROME_USER_AGENT;
+
 let mainWindow = null;
 let powerSaveId = null;
 let asioProcess = null;
@@ -114,9 +118,33 @@ function createWindow() {
     }
   });
 
+  mainWindow.webContents.setUserAgent(CHROME_USER_AGENT);
+
   // Auto-grant all MIDI and media permissions
   session.defaultSession.setPermissionCheckHandler(() => true);
   session.defaultSession.setPermissionRequestHandler((wc, p, cb) => cb(true));
+
+  // Handle popup windows (e.g. Google OAuth Sign-In for Google Sheets sync)
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    console.log('[SynthHost] Opening authentication popup:', url);
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        width: 540,
+        height: 680,
+        autoHideMenuBar: true,
+        alwaysOnTop: true, // Floats cleanly over the fullscreen synth
+        center: true,
+        modal: false,
+        title: 'Google Sign-In',
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+          sandbox: true
+        }
+      }
+    };
+  });
 
   powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
 
@@ -131,8 +159,9 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
-    if (message.includes('[SynthHost]')) {
-      console.log('[Renderer]', message);
+    const levelStr = level === 3 ? 'ERROR' : level === 2 ? 'WARN' : 'LOG';
+    if (message.includes('[SynthHost]') || message.includes('Google') || message.includes('OAuth') || level >= 2) {
+      console.log(`[Renderer ${levelStr}]`, message);
     }
   });
 
@@ -152,7 +181,25 @@ function createWindow() {
   });
 }
 
+app.on('web-contents-created', (event, contents) => {
+  contents.setUserAgent(CHROME_USER_AGENT);
+  if (contents.getType() === 'window') {
+    contents.on('did-finish-load', () => {
+      console.log('[SynthHost] Popup window loaded:', contents.getURL());
+    });
+    contents.on('console-message', (e, level, msg) => {
+      console.log('[Popup Console]', msg);
+    });
+  }
+});
+
 app.whenReady().then(() => {
+  session.defaultSession.setUserAgent(CHROME_USER_AGENT);
+  session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+    details.requestHeaders['User-Agent'] = CHROME_USER_AGENT;
+    callback({ cancel: false, requestHeaders: details.requestHeaders });
+  });
+
   startAsioSink();
   createWindow();
 });
