@@ -79,7 +79,7 @@ function createWindow() {
     show: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      nodeIntegration: true,
+      nodeIntegration: false,
       contextIsolation: false,
       backgroundThrottling: false,
       autoplayPolicy: 'no-user-gesture-required'

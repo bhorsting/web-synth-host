@@ -87,12 +87,13 @@ if (OriginalAudioContext) {
 
   // Intercept all AudioNode.connect calls to redirect destination connections to our ASIO master bus
   const origConnect = AudioNode.prototype.connect;
-  AudioNode.prototype.connect = function(destination, outputIndex, inputIndex) {
+  AudioNode.prototype.connect = function(destination) {
     if (destination === this.context.destination && this.context._asioMasterBus) {
-      // Divert audio from Chromium's 128ms output queue into our direct ASIO bus
-      return origConnect.call(this, this.context._asioMasterBus, outputIndex, inputIndex);
+      const args = Array.from(arguments);
+      args[0] = this.context._asioMasterBus;
+      return origConnect.apply(this, args);
     }
-    return origConnect.call(this, destination, outputIndex, inputIndex);
+    return origConnect.apply(this, arguments);
   };
 }
 
