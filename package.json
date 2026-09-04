@@ -16,5 +16,8 @@
   "license": "MIT",
   "devDependencies": {
     "electron": "^44.2.0"
+  },
+  "dependencies": {
+    "audify": "^1.10.1"
   }
 }

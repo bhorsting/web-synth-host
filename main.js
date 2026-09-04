@@ -1,77 +1,102 @@
-const { app, BrowserWindow, powerSaveBlocker, session } = require('electron');
+const { app, BrowserWindow, powerSaveBlocker, session, ipcMain } = require('electron');
 const path = require('path');
+const { spawn } = require('child_process');
 
 // ============================================================================
-// HARDWARE LOW-LATENCY CHROMIUM SWITCHES FOR ESI U168XT
+// HARDWARE LOW-LATENCY CHROMIUM SWITCHES
 // ============================================================================
 
-const bufferArg = process.argv.find(a => a.startsWith('--buffer='));
-const bufferSize = bufferArg ? bufferArg.split('=')[1] : '128';
-
-// 1. Force WASAPI Exclusive Mode (bypasses Windows Audio Engine mixer audiodg.exe)
-app.commandLine.appendSwitch('enable-exclusive-audio');
-
-// 2. Hardware buffer size (128 frames = 2.67ms @ 48kHz, 64 frames = 1.33ms)
-app.commandLine.appendSwitch('audio-buffer-size', bufferSize);
-
-// 3. Boost internal audio rendering thread priority
 app.commandLine.appendSwitch('high-priority-internal-threads');
-
-// 4. Bypass unnecessary audio resampling
 app.commandLine.appendSwitch('disable-audio-output-resampler');
-
-// 5. Enable WebMIDI for hardware MIDI controllers / keyboards
 app.commandLine.appendSwitch('enable-web-midi');
-
-// 6. Prevent audio autoplay blocking
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-
-console.log(`[SynthHost] Audio flags configured (buffer size: ${bufferSize})`);
 
 let mainWindow = null;
 let powerSaveId = null;
+let asioProcess = null;
+let asioStatus = { ready: false, latencySamples: 64, latencyMs: 1.33, driver: 'ASIO 2.0 - ESI U168 XT' };
+
+function startAsioSink() {
+  const asioExe = path.join(__dirname, 'asio-bridge', 'AsioSink.exe');
+  console.log('[SynthHost] Starting Native ASIO Bridge:', asioExe);
+
+  try {
+    asioProcess = spawn(asioExe, [], {
+      stdio: ['pipe', 'pipe', 'inherit'],
+      windowsHide: true
+    });
+
+    asioProcess.stdout.on('data', (chunk) => {
+      const msg = chunk.toString();
+      console.log('[ASIO Bridge]', msg.trim());
+
+      if (msg.includes('ASIO_READY')) {
+        const matchLat = msg.match(/latency=(\d+)/);
+        const lat = matchLat ? parseInt(matchLat[1]) : 64;
+        asioStatus = {
+          ready: true,
+          latencySamples: lat,
+          latencyMs: parseFloat((lat / 48000 * 1000).toFixed(2)),
+          driver: 'ASIO 2.0 - ESI U168 XT'
+        };
+
+        if (mainWindow && mainWindow.webContents) {
+          mainWindow.webContents.send('asio-status-update', asioStatus);
+        }
+      }
+    });
+
+    asioProcess.on('exit', (code) => {
+      console.log('[ASIO Bridge] Process exited with code:', code);
+      asioStatus.ready = false;
+      asioProcess = null;
+    });
+  } catch (err) {
+    console.error('[ASIO Bridge] Failed to launch:', err);
+  }
+}
+
+// Receive Float32 PCM audio frames from AudioWorklet in renderer
+ipcMain.on('stream-audio-frame', (event, buffer) => {
+  if (asioProcess && asioProcess.stdin && asioProcess.stdin.writable) {
+    asioProcess.stdin.write(buffer);
+  }
+});
+
+ipcMain.handle('get-asio-status', () => asioStatus);
 
 function createWindow() {
-  console.log('[SynthHost] Creating BrowserWindow...');
-  
+  console.log('[SynthHost] Creating BrowserWindow in Fullscreen...');
+
   mainWindow = new BrowserWindow({
     width: 1480,
     height: 920,
     minWidth: 1024,
     minHeight: 600,
-    fullscreen: true, // Launch in fullscreen at start
-    title: 'Roland Jupiter-8 Synth (ESI U168XT Low-Latency Host)',
+    fullscreen: true,
+    title: 'Roland Jupiter-8 Synth (Native ASIO - ESI U168XT)',
     backgroundColor: '#0a0a0f',
     show: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      nodeIntegration: false,
+      nodeIntegration: true,
       contextIsolation: false,
       backgroundThrottling: false,
       autoplayPolicy: 'no-user-gesture-required'
     }
   });
 
-  // Auto-grant MIDI, speaker-selection, and audio device enumeration permissions
-  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
-    return true;
-  });
-
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    return callback(true);
-  });
+  // Auto-grant all MIDI and media permissions
+  session.defaultSession.setPermissionCheckHandler(() => true);
+  session.defaultSession.setPermissionRequestHandler((wc, p, cb) => cb(true));
 
   powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
 
-  console.log('[SynthHost] Loading URL...');
+  console.log('[SynthHost] Loading Synth URL...');
   mainWindow.loadURL('https://jupiter-8-web-synth-693154064316.us-west1.run.app/');
 
   mainWindow.webContents.on('did-finish-load', () => {
-    console.log('[SynthHost] Page finished loading successfully!');
-  });
-
-  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
-    console.error(`[SynthHost] Page failed to load: ${errorDescription} (${errorCode})`);
+    console.log('[SynthHost] Synth page loaded successfully!');
   });
 
   // Keyboard shortcuts: F11 or Escape to toggle Fullscreen, F12 for DevTools
@@ -91,11 +116,18 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  console.log('[SynthHost] app.whenReady fired.');
+  startAsioSink();
   createWindow();
 });
 
 app.on('window-all-closed', () => {
+  if (asioProcess) {
+    try {
+      asioProcess.stdin.end();
+      asioProcess.kill();
+    } catch {}
+    asioProcess = null;
+  }
   if (powerSaveId !== null && powerSaveBlocker.isStarted(powerSaveId)) {
     powerSaveBlocker.stop(powerSaveId);
   }
