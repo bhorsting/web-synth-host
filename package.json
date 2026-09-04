@@ -1,0 +1,20 @@
+{
+  "name": "jupiter8-synth-host",
+  "version": "1.0.0",
+  "description": "Ultra-low latency Electron host for Jupiter-8 Web Synth targeting ESI U168XT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [
+    "synth",
+    "asio",
+    "jupiter-8",
+    "low-latency"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^44.2.0"
+  }
+}
