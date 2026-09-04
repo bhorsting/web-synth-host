@@ -290,10 +290,10 @@ setInterval(() => {
 }, 1000);
 
 // Intercept AudioContext to attach the high-speed ASIO tap
+const origConnect = AudioNode.prototype.connect;
+const origDisconnect = AudioNode.prototype.disconnect;
 const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
 if (OriginalAudioContext) {
-  const origConnect = AudioNode.prototype.connect;
-
   function setupAsioPipeline(ctx) {
     if (ctx._asioInitialized) return;
     ctx._asioInitialized = true;
@@ -396,8 +396,7 @@ if (OriginalAudioContext) {
     }
     return origConnect.apply(this, arguments);
   };
-
-  const origDisconnect = AudioNode.prototype.disconnect;
+ 
   AudioNode.prototype.disconnect = function(destination) {
     if (this._isAsioInternal) {
       return origDisconnect.apply(this, arguments);
@@ -428,30 +427,82 @@ window.addEventListener('DOMContentLoaded', () => {
 function createLatencyHUD() {
   if (document.getElementById('synth-host-latency-hud')) return;
 
-  const hud = document.createElement('div');
-  hud.id = 'synth-host-latency-hud';
-  hud.style.cssText = `
+  const hudContainer = document.createElement('div');
+  hudContainer.id = 'synth-host-latency-hud';
+  hudContainer.style.cssText = `
     position: fixed;
-    top: 12px;
+    top: 8px;
     right: 12px;
     z-index: 2147483647;
-    background: rgba(10, 12, 18, 0.94);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    user-select: none;
+  `;
+
+  // Sleek, unobtrusive pill trigger button
+  const pill = document.createElement('button');
+  pill.id = 'synth-host-hud-pill';
+  pill.title = 'Click to open ASIO & Host Settings (Drag to reposition)';
+  pill.style.cssText = `
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(15, 23, 42, 0.88);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 9999px;
+    padding: 3px 9px;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+    transition: background 0.15s, border-color 0.15s, transform 0.1s;
+    outline: none;
+    color: #e5e7eb;
+    font-family: inherit;
+  `;
+
+  pill.innerHTML = `
+    <span id="hud-pill-dot" style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 6px #22c55e; flex-shrink: 0;"></span>
+    <span style="font-weight: 700; color: #4ade80; font-size: 10px; letter-spacing: 0.5px;">⚡ ASIO</span>
+    <span id="hud-pill-lat" style="color: #cbd5e1; font-size: 10px; font-weight: 600; font-family: monospace;">4.00 ms</span>
+    <span id="hud-pill-chevron" style="color: #64748b; font-size: 8px; margin-left: 1px; transition: transform 0.2s;">▼</span>
+  `;
+
+  pill.addEventListener('mouseenter', () => {
+    pill.style.background = 'rgba(30, 41, 59, 0.95)';
+    pill.style.borderColor = 'rgba(74, 222, 128, 0.5)';
+  });
+  pill.addEventListener('mouseleave', () => {
+    if (panel.style.display !== 'block') {
+      pill.style.background = 'rgba(15, 23, 42, 0.88)';
+      pill.style.borderColor = 'rgba(255, 255, 255, 0.18)';
+    }
+  });
+
+  // Collapsed HUD Panel (hidden by default)
+  const panel = document.createElement('div');
+  panel.id = 'synth-host-hud-panel';
+  panel.style.cssText = `
+    display: none;
+    position: fixed;
+    top: 38px;
+    right: 12px;
+    z-index: 2147483646;
+    background: rgba(10, 12, 18, 0.96);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
     border: 1px solid rgba(34, 197, 94, 0.5);
     border-radius: 8px;
     padding: 10px 14px;
     color: #e5e7eb;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    font-family: inherit;
     font-size: 11px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7);
-    user-select: none;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.8);
     line-height: 1.5;
-    min-width: 280px;
-    max-width: 340px;
+    width: 320px;
+    box-sizing: border-box;
   `;
 
-  hud.innerHTML = `
+  panel.innerHTML = `
     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 4px;">
       <div style="display: flex; align-items: center; gap: 6px;">
         <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #22c55e;" id="hud-status-dot"></span>
@@ -459,7 +510,7 @@ function createLatencyHUD() {
           ⚡ TRUE ASIO 2.0 HOST
         </span>
       </div>
-      <button id="hud-toggle-btn" style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; color: #9ca3af; cursor: pointer; font-size: 10px; padding: 1px 6px;">–</button>
+      <button id="hud-close-btn" style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; color: #9ca3af; cursor: pointer; font-size: 11px; padding: 1px 6px; line-height: 1.2;" title="Close HUD">✕</button>
     </div>
     <div id="hud-body">
       <div style="display: grid; grid-template-columns: auto auto; gap: 3px 12px; margin-bottom: 6px;">
@@ -513,16 +564,128 @@ function createLatencyHUD() {
     </div>
   `;
 
-  document.body.appendChild(hud);
+  hudContainer.appendChild(pill);
+  document.body.appendChild(hudContainer);
+  document.body.appendChild(panel);
 
-  const toggleBtn = hud.querySelector('#hud-toggle-btn');
-  const body = hud.querySelector('#hud-body');
-  const resumeBtn = hud.querySelector('#hud-resume-btn');
-  const reloadBtn = hud.querySelector('#hud-reload-btn');
-  const testBtn = hud.querySelector('#hud-test-btn');
-  const authBtn = hud.querySelector('#hud-auth-btn');
-  const stereoBtn = hud.querySelector('#hud-stereo-btn');
-  let isMinimized = false;
+  const chevron = pill.querySelector('#hud-pill-chevron');
+  const closeBtn = panel.querySelector('#hud-close-btn');
+  const resumeBtn = panel.querySelector('#hud-resume-btn');
+  const reloadBtn = panel.querySelector('#hud-reload-btn');
+  const testBtn = panel.querySelector('#hud-test-btn');
+  const authBtn = panel.querySelector('#hud-auth-btn');
+  const stereoBtn = panel.querySelector('#hud-stereo-btn');
+
+  function updatePanelPosition() {
+    const pillRect = pill.getBoundingClientRect();
+    const panelWidth = 320;
+    let rightPos = window.innerWidth - pillRect.right;
+    if (rightPos < 10) rightPos = 10;
+    if (pillRect.right - panelWidth < 10) {
+      panel.style.left = '10px';
+      panel.style.right = 'auto';
+    } else {
+      panel.style.right = `${rightPos}px`;
+      panel.style.left = 'auto';
+    }
+
+    if (pillRect.bottom + 320 > window.innerHeight && pillRect.top > 320) {
+      panel.style.top = `${Math.max(10, pillRect.top - 320)}px`;
+    } else {
+      panel.style.top = `${pillRect.bottom + 6}px`;
+    }
+  }
+
+  function openHUD() {
+    panel.style.display = 'block';
+    if (chevron) chevron.style.transform = 'rotate(180deg)';
+    pill.style.borderColor = 'rgba(74, 222, 128, 0.6)';
+    pill.style.background = 'rgba(30, 41, 59, 0.95)';
+    updatePanelPosition();
+  }
+
+  function closeHUD() {
+    panel.style.display = 'none';
+    if (chevron) chevron.style.transform = 'rotate(0deg)';
+    pill.style.borderColor = 'rgba(255, 255, 255, 0.18)';
+    pill.style.background = 'rgba(15, 23, 42, 0.88)';
+  }
+
+  function toggleHUD() {
+    if (panel.style.display === 'block') {
+      closeHUD();
+    } else {
+      openHUD();
+    }
+  }
+
+  // Draggable pill
+  let isDragging = false;
+  let dragMoved = false;
+  let startX = 0, startY = 0;
+  let initLeft = 0, initTop = 0;
+
+  pill.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    isDragging = true;
+    dragMoved = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    const r = hudContainer.getBoundingClientRect();
+    initLeft = r.left;
+    initTop = r.top;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      dragMoved = true;
+      hudContainer.style.left = `${Math.max(4, Math.min(window.innerWidth - pill.offsetWidth - 4, initLeft + dx))}px`;
+      hudContainer.style.top = `${Math.max(4, Math.min(window.innerHeight - pill.offsetHeight - 4, initTop + dy))}px`;
+      hudContainer.style.right = 'auto';
+      if (panel.style.display === 'block') {
+        updatePanelPosition();
+      }
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    isDragging = false;
+  });
+
+  pill.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (dragMoved) return;
+    toggleHUD();
+  });
+
+  closeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeHUD();
+  });
+
+  // Close when clicking outside
+  window.addEventListener('mousedown', (e) => {
+    if (panel.style.display === 'block') {
+      const target = e.target;
+      if (target instanceof Node) {
+        if (!panel.contains(target) && !pill.contains(target)) {
+          closeHUD();
+        }
+      } else {
+        closeHUD();
+      }
+    }
+  });
+
+  // Close on Escape key
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && panel.style.display === 'block') {
+      closeHUD();
+    }
+  });
 
   stereoBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -544,6 +707,9 @@ function createLatencyHUD() {
   });
 
   window.__playTestTone = () => {
+    if (!activeAudioContext && window.jupiterEngine && window.jupiterEngine.ctx) {
+      activeAudioContext = window.jupiterEngine.ctx;
+    }
     if (!activeAudioContext) {
       console.warn('[SynthHost] Cannot test audio: activeAudioContext not ready yet');
       return false;
@@ -601,13 +767,6 @@ function createLatencyHUD() {
     window.__playTestTone();
   });
 
-  toggleBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    isMinimized = !isMinimized;
-    body.style.display = isMinimized ? 'none' : 'block';
-    toggleBtn.textContent = isMinimized ? '+' : '–';
-  });
-
   resumeBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (activeAudioContext) {
@@ -624,12 +783,17 @@ function createLatencyHUD() {
 }
 
 function updateHUD() {
+  if (!activeAudioContext && window.jupiterEngine && window.jupiterEngine.ctx) {
+    activeAudioContext = window.jupiterEngine.ctx;
+  }
   const elHwBuf = document.getElementById('hud-hw-buf');
   const elTotal = document.getElementById('hud-total-lat');
   const elRate = document.getElementById('hud-sample-rate');
   const elStatus = document.getElementById('hud-asio-status');
   const elDot = document.getElementById('hud-status-dot');
   const resumeBtn = document.getElementById('hud-resume-btn');
+  const pillDot = document.getElementById('hud-pill-dot');
+  const pillLat = document.getElementById('hud-pill-lat');
 
   const sr = (activeAudioContext && activeAudioContext.sampleRate) ? activeAudioContext.sampleRate : 48000;
   const quantumMs = (128 / sr * 1000); // 2.67ms @ 48kHz
@@ -637,6 +801,9 @@ function updateHUD() {
   const hwMs = (hwFrames / sr * 1000);
   const totalMs = (quantumMs + hwMs).toFixed(2);
 
+  if (pillLat) {
+    pillLat.textContent = `${totalMs} ms`;
+  }
   if (elHwBuf) {
     elHwBuf.textContent = `${hwFrames} frames (${hwMs.toFixed(2)} ms)`;
   }
@@ -652,15 +819,27 @@ function updateHUD() {
       elStatus.textContent = `STREAMING (${hwFrames}s)`;
       elStatus.style.color = '#4ade80';
       if (elDot) elDot.style.background = '#22c55e';
+      if (pillDot) {
+        pillDot.style.background = '#22c55e';
+        pillDot.style.boxShadow = '0 0 6px #22c55e';
+      }
     } else if (asioStatus.error) {
       elStatus.textContent = `ERR: ${asioStatus.error.substring(0, 18)}`;
       elStatus.title = asioStatus.error;
       elStatus.style.color = '#ef4444';
       if (elDot) elDot.style.background = '#ef4444';
+      if (pillDot) {
+        pillDot.style.background = '#ef4444';
+        pillDot.style.boxShadow = '0 0 6px #ef4444';
+      }
     } else {
       elStatus.textContent = 'CONNECTING...';
       elStatus.style.color = '#facc15';
       if (elDot) elDot.style.background = '#eab308';
+      if (pillDot) {
+        pillDot.style.background = '#eab308';
+        pillDot.style.boxShadow = '0 0 6px #eab308';
+      }
     }
   }
 
