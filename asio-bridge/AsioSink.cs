@@ -2,134 +2,88 @@ using System;
 using System.IO;
 using NAudio.Wave;
 
-class FloatCircularBuffer {
-    private readonly float[] buffer;
+class CircularBuffer {
+    private readonly byte[] buffer;
     private int writePos = 0;
     private int readPos = 0;
-    private int availableFloats = 0;
+    private int count = 0;
     private readonly object lockObj = new object();
 
-    private int targetCushionFrames = 256;
-    private int maxAllowedFrames = 512;
-    private int preRollFrames = 256;
-    private bool isBuffering = true;
+    // 16384 bytes = 2048 stereo Float32 frames = ~42.6 ms of maximum backlog @ 48kHz.
+    // Generous enough to never drop samples during normal playing with 256-sample ASIO buffers,
+    // yet tight enough that latency stays below 42ms even after temporary lags.
+    private readonly int maxCapacity = 16384;
 
-    // Default capacity: 32768 floats = 16384 stereo frames (~341 ms @ 48kHz)
-    public FloatCircularBuffer(int capacityFloats = 32768) {
-        buffer = new float[capacityFloats];
+    public CircularBuffer(int capacity = 65536) {
+        buffer = new byte[capacity];
     }
 
-    public void ConfigureCushion(int hwBufferFrames) {
-        lock (lockObj) {
-            // Target cushion: at least 256 frames (~5.33ms), or 2x hardware buffer
-            targetCushionFrames = Math.Max(256, hwBufferFrames * 2);
-            // Clamp threshold: trim oldest backlog if buffer exceeds cushion + 2x hw buffer
-            maxAllowedFrames = targetCushionFrames + Math.Max(256, hwBufferFrames * 2);
-            preRollFrames = targetCushionFrames;
-            isBuffering = true;
-        }
-    }
-
-    public void Write(float[] src, int srcFloatOffset, int floatCount) {
-        if (floatCount <= 0) return;
-        // Strict stereo frame alignment (even number of floats)
-        int validFloats = (floatCount / 2) * 2;
-        if (validFloats <= 0) return;
+    public void Write(byte[] data, int offset, int length) {
+        if (length <= 0) return;
+        // Strictly align to 8-byte stereo Float32 frames
+        int validBytes = (length / 8) * 8;
+        if (validBytes <= 0) return;
 
         lock (lockObj) {
             int spaceToEnd = buffer.Length - writePos;
-            if (validFloats <= spaceToEnd) {
-                Array.Copy(src, srcFloatOffset, buffer, writePos, validFloats);
-                writePos = (writePos + validFloats) % buffer.Length;
+            if (validBytes <= spaceToEnd) {
+                Buffer.BlockCopy(data, offset, buffer, writePos, validBytes);
+                writePos = (writePos + validBytes) % buffer.Length;
             } else {
-                Array.Copy(src, srcFloatOffset, buffer, writePos, spaceToEnd);
-                int remaining = validFloats - spaceToEnd;
-                Array.Copy(src, srcFloatOffset + spaceToEnd, buffer, 0, remaining);
+                Buffer.BlockCopy(data, offset, buffer, writePos, spaceToEnd);
+                int remaining = validBytes - spaceToEnd;
+                Buffer.BlockCopy(data, offset + spaceToEnd, buffer, 0, remaining);
                 writePos = remaining;
             }
 
-            availableFloats += validFloats;
-            int currentFrames = availableFloats / 2;
+            count += validBytes;
 
-            if (isBuffering && currentFrames >= preRollFrames) {
-                isBuffering = false;
-            }
-
-            // Real-time latency clamp:
-            // Drop oldest excess stereo frames if backlog exceeds maxAllowedFrames
-            if (currentFrames > maxAllowedFrames) {
-                int excessFrames = currentFrames - targetCushionFrames;
-                int excessFloats = excessFrames * 2;
-                readPos = (readPos + excessFloats) % buffer.Length;
-                availableFloats -= excessFloats;
+            // Clamping backlog if queue exceeds 16KB (~42ms)
+            if (count > maxCapacity) {
+                int excess = count - maxCapacity;
+                excess = (excess / 8) * 8;
+                readPos = (readPos + excess) % buffer.Length;
+                count -= excess;
             }
         }
     }
 
-    public int ReadBytes(byte[] dest, int destByteOffset, int byteCount) {
-        int neededFloats = byteCount / 4;
-        int neededFrames = neededFloats / 2;
-        int floatsToProcess = neededFrames * 2;
-        int bytesToProcess = floatsToProcess * 4;
-
+    public int Read(byte[] dest, int offset, int length) {
         lock (lockObj) {
-            int availableFrames = availableFloats / 2;
+            int framesAvailable = count / 8;
+            int framesRequested = length / 8;
+            int framesToRead = Math.Min(framesRequested, framesAvailable);
+            int bytesToRead = framesToRead * 8;
 
-            if (isBuffering || availableFrames < neededFrames) {
-                if (isBuffering) {
-                    Array.Clear(dest, destByteOffset, byteCount);
-                    return byteCount;
+            if (bytesToRead > 0) {
+                int spaceToEnd = buffer.Length - readPos;
+                if (bytesToRead <= spaceToEnd) {
+                    Buffer.BlockCopy(buffer, readPos, dest, offset, bytesToRead);
+                    readPos = (readPos + bytesToRead) % buffer.Length;
+                } else {
+                    Buffer.BlockCopy(buffer, readPos, dest, offset, spaceToEnd);
+                    int remaining = bytesToRead - spaceToEnd;
+                    Buffer.BlockCopy(buffer, 0, dest, offset + spaceToEnd, remaining);
+                    readPos = remaining;
                 }
-
-                // Buffer underrun: read whatever complete frames are available
-                int toReadFrames = availableFrames;
-                int toReadFloats = toReadFrames * 2;
-                int toReadBytes = toReadFloats * 4;
-
-                if (toReadFloats > 0) {
-                    CopyFloatsToBytes(dest, destByteOffset, toReadFloats);
-                    availableFloats -= toReadFloats;
-                }
-
-                // Clear remaining bytes to silence
-                Array.Clear(dest, destByteOffset + toReadBytes, byteCount - toReadBytes);
-
-                // Trigger re-buffering cushion to prevent stutter on every subsequent callback
-                isBuffering = true;
-                return byteCount;
+                count -= bytesToRead;
             }
 
-            // Normal smooth playback
-            CopyFloatsToBytes(dest, destByteOffset, floatsToProcess);
-            availableFloats -= floatsToProcess;
-
-            if (byteCount > bytesToProcess) {
-                Array.Clear(dest, destByteOffset + bytesToProcess, byteCount - bytesToProcess);
+            // Fill remainder with silence (zeros)
+            if (bytesToRead < length) {
+                Array.Clear(dest, offset + bytesToRead, length - bytesToRead);
             }
 
-            return byteCount;
-        }
-    }
-
-    private void CopyFloatsToBytes(byte[] dest, int destByteOffset, int floatCount) {
-        int spaceToEnd = buffer.Length - readPos;
-        if (floatCount <= spaceToEnd) {
-            Buffer.BlockCopy(buffer, readPos * 4, dest, destByteOffset, floatCount * 4);
-            readPos = (readPos + floatCount) % buffer.Length;
-        } else {
-            Buffer.BlockCopy(buffer, readPos * 4, dest, destByteOffset, spaceToEnd * 4);
-            int remaining = floatCount - spaceToEnd;
-            Buffer.BlockCopy(buffer, 0, dest, destByteOffset + (spaceToEnd * 4), remaining * 4);
-            readPos = remaining;
+            return length;
         }
     }
 }
 
 class AsioStreamProvider : IWaveProvider {
     private readonly WaveFormat waveFormat;
-    private readonly FloatCircularBuffer circularBuffer;
+    private readonly CircularBuffer circularBuffer;
 
-    public AsioStreamProvider(int sampleRate, FloatCircularBuffer buffer) {
+    public AsioStreamProvider(int sampleRate, CircularBuffer buffer) {
         this.waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, 2);
         this.circularBuffer = buffer;
     }
@@ -139,7 +93,7 @@ class AsioStreamProvider : IWaveProvider {
     }
 
     public int Read(byte[] buffer, int offset, int count) {
-        return circularBuffer.ReadBytes(buffer, offset, count);
+        return circularBuffer.Read(buffer, offset, count);
     }
 }
 
@@ -153,58 +107,46 @@ class Program {
         }
 
         try {
-            var ring = new FloatCircularBuffer();
+            var ring = new CircularBuffer();
             var provider = new AsioStreamProvider(sampleRate, ring);
 
             using (var asio = new AsioOut(driverName)) {
                 asio.Init(provider);
-
-                int hwBufferFrames = asio.FramesPerBuffer > 0 ? asio.FramesPerBuffer : asio.PlaybackLatency;
-                if (hwBufferFrames <= 0) hwBufferFrames = 64;
-                ring.ConfigureCushion(hwBufferFrames);
-
                 asio.Play();
 
                 // Notify parent Electron process
-                Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":buffer=" + hwBufferFrames + ":channels=" + asio.DriverOutputChannelCount);
+                Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":channels=" + asio.DriverOutputChannelCount);
                 Console.Out.Flush();
 
                 using (var stdin = Console.OpenStandardInput()) {
                     byte[] pipeBuf = new byte[8192];
                     byte[] comboBuf = new byte[8192 + 8];
-                    int remainderBytes = 0;
-                    float[] floatBuf = new float[4096];
+                    int remainder = 0;
 
                     int bytesRead;
                     while ((bytesRead = stdin.Read(pipeBuf, 0, pipeBuf.Length)) > 0) {
-                        if (remainderBytes > 0) {
-                            Buffer.BlockCopy(pipeBuf, 0, comboBuf, remainderBytes, bytesRead);
-                            int totalBytes = remainderBytes + bytesRead;
-                            int completeFrames = totalBytes / 8;
-                            int validBytes = completeFrames * 8;
-                            int newRemainder = totalBytes - validBytes;
+                        if (remainder > 0) {
+                            Buffer.BlockCopy(pipeBuf, 0, comboBuf, remainder, bytesRead);
+                            int total = remainder + bytesRead;
+                            int valid = (total / 8) * 8;
+                            int newRem = total - valid;
 
-                            int floatCount = validBytes / 4;
-                            Buffer.BlockCopy(comboBuf, 0, floatBuf, 0, validBytes);
-                            ring.Write(floatBuf, 0, floatCount);
+                            ring.Write(comboBuf, 0, valid);
 
-                            if (newRemainder > 0) {
-                                Buffer.BlockCopy(comboBuf, validBytes, comboBuf, 0, newRemainder);
+                            if (newRem > 0) {
+                                Buffer.BlockCopy(comboBuf, valid, comboBuf, 0, newRem);
                             }
-                            remainderBytes = newRemainder;
+                            remainder = newRem;
                         } else {
-                            int completeFrames = bytesRead / 8;
-                            int validBytes = completeFrames * 8;
-                            int newRemainder = bytesRead - validBytes;
+                            int valid = (bytesRead / 8) * 8;
+                            int newRem = bytesRead - valid;
 
-                            int floatCount = validBytes / 4;
-                            Buffer.BlockCopy(pipeBuf, 0, floatBuf, 0, validBytes);
-                            ring.Write(floatBuf, 0, floatCount);
+                            ring.Write(pipeBuf, 0, valid);
 
-                            if (newRemainder > 0) {
-                                Buffer.BlockCopy(pipeBuf, validBytes, comboBuf, 0, newRemainder);
+                            if (newRem > 0) {
+                                Buffer.BlockCopy(pipeBuf, valid, comboBuf, 0, newRem);
                             }
-                            remainderBytes = newRemainder;
+                            remainder = newRem;
                         }
                     }
                 }
