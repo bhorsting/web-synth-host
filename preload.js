@@ -38,11 +38,16 @@ window.addEventListener('DOMContentLoaded', () => {
   console.log('[SynthHost] Preload DOM ready.');
   createLatencyHUD();
   setInterval(updateHUD, 300);
-  populateDeviceList();
+
+  // Initial populate
+  setTimeout(populateDeviceList, 500);
 
   // Listen for device connect / disconnect
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-    navigator.mediaDevices.addEventListener('devicechange', populateDeviceList);
+    navigator.mediaDevices.addEventListener('devicechange', () => {
+      console.log('[SynthHost] Audio device change detected.');
+      populateDeviceList();
+    });
   }
 
   // Auto-unlock audio on user gesture
@@ -77,8 +82,8 @@ function createLatencyHUD() {
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7);
     user-select: none;
     line-height: 1.5;
-    min-width: 270px;
-    max-width: 320px;
+    min-width: 280px;
+    max-width: 340px;
   `;
 
   hud.innerHTML = `
@@ -94,13 +99,13 @@ function createLatencyHUD() {
     <div id="hud-body">
       <!-- Device warning banner if Voicemeeter is active -->
       <div id="hud-device-alert" style="display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; font-size: 10px; color: #fca5a5;">
-        ⚠️ <b>Voicemeeter active:</b> Voicemeeter adds 128ms buffer. Turn on/select ESI U168XT below!
+        ⚠️ <b>Voicemeeter active:</b> Voicemeeter adds 128ms buffer. Select ESI U168XT below or click Restart!
       </div>
 
       <div style="margin-bottom: 8px;">
         <div style="color: #9ca3af; font-size: 10px; margin-bottom: 2px;">Audio Output Device:</div>
         <select id="hud-device-select" style="width: 100%; background: #1e2029; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 4px; padding: 3px 6px; font-size: 10px; outline: none; cursor: pointer;">
-          <option value="default">Default Device</option>
+          <option value="default">Scanning devices...</option>
         </select>
       </div>
 
@@ -125,6 +130,9 @@ function createLatencyHUD() {
       </div>
 
       <div style="display: flex; gap: 6px; margin-top: 6px;">
+        <button id="hud-reload-btn" style="flex: 1; background: #2563eb; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
+          🔄 Restart Synth Engine
+        </button>
         <button id="hud-resume-btn" style="display: none; flex: 1; background: #ea580c; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
           ▶ Click to Start Audio
         </button>
@@ -142,6 +150,7 @@ function createLatencyHUD() {
   const toggleBtn = hud.querySelector('#hud-toggle-btn');
   const body = hud.querySelector('#hud-body');
   const resumeBtn = hud.querySelector('#hud-resume-btn');
+  const reloadBtn = hud.querySelector('#hud-reload-btn');
   const deviceSelect = hud.querySelector('#hud-device-select');
   let isMinimized = false;
 
@@ -157,6 +166,11 @@ function createLatencyHUD() {
     if (activeAudioContext) {
       activeAudioContext.resume().then(updateHUD);
     }
+  });
+
+  reloadBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    window.location.reload();
   });
 
   deviceSelect.addEventListener('change', async (e) => {
@@ -178,42 +192,64 @@ async function populateDeviceList() {
   if (!select || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
 
   try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const outputs = devices.filter(d => d.kind === 'audiooutput');
-    
-    // Save current selection
+    let devices = await navigator.mediaDevices.enumerateDevices();
+    let outputs = devices.filter(d => d.kind === 'audiooutput');
+
+    // If labels are blank, request audio permission to reveal hardware names
+    if (outputs.length > 0 && outputs.every(d => !d.label)) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop());
+        devices = await navigator.mediaDevices.enumerateDevices();
+        outputs = devices.filter(d => d.kind === 'audiooutput');
+      } catch (e) {
+        console.log('[SynthHost] Could not fetch media stream for labels:', e);
+      }
+    }
+
     const currentVal = select.value;
     select.innerHTML = '';
 
-    let hasVoicemeeterAsDefault = false;
-    let hasEsi = false;
+    let hasVoicemeeter = false;
+    let esiDevice = null;
 
     outputs.forEach(dev => {
       const opt = document.createElement('option');
       opt.value = dev.deviceId;
-      opt.textContent = dev.label || `Device ${dev.deviceId.slice(0, 8)}`;
-      if (dev.label.toLowerCase().includes('voicemeeter') && (dev.deviceId === 'default' || dev.label.toLowerCase().includes('default'))) {
-        hasVoicemeeterAsDefault = true;
+      const label = dev.label || `Audio Output (${dev.deviceId.slice(0, 8)})`;
+      opt.textContent = label;
+
+      const lower = label.toLowerCase();
+      if (lower.includes('voicemeeter')) {
+        hasVoicemeeter = true;
       }
-      if (dev.label.toLowerCase().includes('esi') || dev.label.toLowerCase().includes('u168')) {
-        hasEsi = true;
-        opt.textContent = `⭐ ${opt.textContent}`;
+      if (lower.includes('esi') || lower.includes('u168')) {
+        esiDevice = dev;
+        opt.textContent = `⭐ ${label}`;
       }
       select.appendChild(opt);
     });
 
-    if (currentVal && Array.from(select.options).some(o => o.value === currentVal)) {
+    // Auto-select ESI device if found and not yet selected
+    if (esiDevice) {
+      if (!currentVal || currentVal === 'default' || currentVal.includes('default')) {
+        select.value = esiDevice.deviceId;
+        if (activeAudioContext && typeof activeAudioContext.setSinkId === 'function') {
+          activeAudioContext.setSinkId(esiDevice.deviceId).then(updateHUD).catch(console.error);
+        }
+      }
+    } else if (currentVal && Array.from(select.options).some(o => o.value === currentVal)) {
       select.value = currentVal;
     }
 
     const alertEl = document.getElementById('hud-device-alert');
     if (alertEl) {
-      if (hasVoicemeeterAsDefault && !hasEsi) {
+      if (hasVoicemeeter && !esiDevice) {
         alertEl.style.display = 'block';
-        alertEl.innerHTML = `⚠️ <b>Voicemeeter is active (128ms buffer)!</b><br>Turn ON or plug in your <b>ESI U168XT</b> so it can bypass Voicemeeter.`;
-      } else if (hasVoicemeeterAsDefault && hasEsi) {
+        alertEl.innerHTML = `⚠️ <b>Voicemeeter is active (128ms buffer)!</b><br>Turn ON your <b>ESI U168XT</b> so it can bypass Voicemeeter.`;
+      } else if (hasVoicemeeter && esiDevice) {
         alertEl.style.display = 'block';
-        alertEl.innerHTML = `⚠️ <b>Voicemeeter is active (128ms)!</b><br>Select your <b>⭐ ESI U168XT</b> in the dropdown above.`;
+        alertEl.innerHTML = `⚠️ <b>Voicemeeter detected:</b> Make sure <b>⭐ ${esiDevice.label}</b> is selected above!`;
       } else {
         alertEl.style.display = 'none';
       }

@@ -52,15 +52,13 @@ function createWindow() {
     }
   });
 
-  // Auto-grant MIDI permissions for hardware keyboards (ESI U168XT MIDI in, USB MIDI, etc.)
+  // Auto-grant MIDI, speaker-selection, and audio device enumeration permissions
   session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
-    if (permission === 'midi' || permission === 'midiSysex') return true;
-    return false;
+    return true;
   });
 
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    if (permission === 'midi' || permission === 'midiSysex') return callback(true);
-    return callback(false);
+    return callback(true);
   });
 
   powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
