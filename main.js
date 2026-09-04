@@ -11,9 +11,10 @@ app.commandLine.appendSwitch('disable-audio-output-resampler');
 app.commandLine.appendSwitch('enable-web-midi');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
-// Standard Chrome User-Agent to allow Google Identity Services / OAuth without disallowed_useragent block
-const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
-app.userAgentFallback = CHROME_USER_AGENT;
+// Standard Firefox User-Agent prevents Google OAuth from checking Chromium-specific Client Hints (sec-ch-ua)
+// and bypasses the embedded webview 'This browser or app may not be secure' block
+const AUTH_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0';
+app.userAgentFallback = AUTH_USER_AGENT;
 
 let mainWindow = null;
 let powerSaveId = null;
@@ -118,7 +119,7 @@ function createWindow() {
     }
   });
 
-  mainWindow.webContents.setUserAgent(CHROME_USER_AGENT);
+  mainWindow.webContents.setUserAgent(AUTH_USER_AGENT);
 
   // Auto-grant all MIDI and media permissions
   session.defaultSession.setPermissionCheckHandler(() => true);
@@ -182,7 +183,7 @@ function createWindow() {
 }
 
 app.on('web-contents-created', (event, contents) => {
-  contents.setUserAgent(CHROME_USER_AGENT);
+  contents.setUserAgent(AUTH_USER_AGENT);
   if (contents.getType() === 'window') {
     contents.on('did-finish-load', () => {
       console.log('[SynthHost] Popup window loaded:', contents.getURL());
@@ -194,9 +195,12 @@ app.on('web-contents-created', (event, contents) => {
 });
 
 app.whenReady().then(() => {
-  session.defaultSession.setUserAgent(CHROME_USER_AGENT);
+  session.defaultSession.setUserAgent(AUTH_USER_AGENT);
   session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    details.requestHeaders['User-Agent'] = CHROME_USER_AGENT;
+    details.requestHeaders['User-Agent'] = AUTH_USER_AGENT;
+    delete details.requestHeaders['sec-ch-ua'];
+    delete details.requestHeaders['sec-ch-ua-mobile'];
+    delete details.requestHeaders['sec-ch-ua-platform'];
     callback({ cancel: false, requestHeaders: details.requestHeaders });
   });
 
