@@ -130,6 +130,12 @@ function createWindow() {
     }
   });
 
+  mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    if (message.includes('[SynthHost]')) {
+      console.log('[Renderer]', message);
+    }
+  });
+
   // Keyboard shortcuts: F11 or Escape to toggle Fullscreen, F12 for DevTools
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if ((input.key === 'F11' || input.key === 'Escape') && input.type === 'keyDown') {

@@ -40,6 +40,10 @@ class AsioTapProcessor extends AudioWorkletProcessor {
         interleaved[i * 2 + 1] = mono[i];
       }
       this.port.postMessage(interleaved.buffer, [interleaved.buffer]);
+    } else {
+      // Continuous silence keeps ASIO clock and ring buffer in steady sync
+      const silent = new Float32Array(256);
+      this.port.postMessage(silent.buffer, [silent.buffer]);
     }
     return true;
   }
@@ -50,68 +54,85 @@ registerProcessor('asio-tap-processor', AsioTapProcessor);
 // Intercept AudioContext to attach the high-speed ASIO tap
 const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
 if (OriginalAudioContext) {
+  const origConnect = AudioNode.prototype.connect;
+
+  function setupAsioPipeline(ctx) {
+    if (ctx._asioInitialized) return;
+    ctx._asioInitialized = true;
+
+    console.log('[SynthHost] Primary Playback AudioContext identified! Attaching Native ASIO Tap...');
+    activeAudioContext = ctx;
+    window.__activeAudioContext = ctx;
+
+    // Master bus that receives all synth output intended for destination
+    ctx._asioMasterBus = ctx.createGain();
+    ctx._asioMasterBus._isAsioInternal = true;
+
+    // Muted destination connection to pull the audio graph through Chromium's hardware clock
+    const silentSink = ctx.createGain();
+    silentSink._isAsioInternal = true;
+    silentSink.gain.value = 0.0;
+    origConnect.call(ctx._asioMasterBus, silentSink);
+    origConnect.call(silentSink, ctx.destination);
+
+    // Initialize AudioWorklet for low-latency Float32 capture
+    const blob = new Blob([workletCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+
+    ctx.audioWorklet.addModule(url).then(() => {
+      URL.revokeObjectURL(url);
+      ctx._asioTapNode = new AudioWorkletNode(ctx, 'asio-tap-processor');
+      ctx._asioTapNode._isAsioInternal = true;
+      origConnect.call(ctx._asioMasterBus, ctx._asioTapNode);
+      origConnect.call(ctx._asioTapNode, silentSink); // Ensures Blink pulls this node every quantum
+
+      ctx._asioTapNode.port.onmessage = (e) => {
+        // Stream raw 128-sample Float32 chunks directly to native ASIO driver
+        ipcRenderer.send('stream-audio-frame', Buffer.from(e.data));
+      };
+
+      console.log('[SynthHost] Native ASIO Tap Processor is LIVE and streaming cleanly!');
+      updateHUD();
+    }).catch(err => {
+      console.error('[SynthHost] Failed to load AudioWorklet module:', err);
+    });
+
+    try {
+      Object.defineProperty(ctx, 'baseLatency', {
+        get: () => 128 / (ctx.sampleRate || 48000),
+        configurable: true
+      });
+      Object.defineProperty(ctx, 'outputLatency', {
+        get: () => (asioStatus.ready ? asioStatus.latencySamples : 64) / (ctx.sampleRate || 48000),
+        configurable: true
+      });
+    } catch (e) {}
+
+    ctx.addEventListener('statechange', () => {
+      updateHUD();
+    });
+  }
+
   window.AudioContext = class PatchedAudioContext extends OriginalAudioContext {
     constructor(options = {}) {
       super({ ...options, latencyHint: 0 });
-      activeAudioContext = this;
-      window.__activeAudioContext = this;
-
-      console.log('[SynthHost] AudioContext created. Initializing Direct ASIO pipeline...');
-
-      // Master bus that receives all synth output
-      this._asioMasterBus = this.createGain();
-
-      // Muted destination connection to prevent Chromium's 128ms WASAPI engine from playing audio
-      const silentSink = this.createGain();
-      silentSink.gain.value = 0.0;
-      this._asioMasterBus.connect(silentSink);
-      silentSink.connect(this.destination);
-
-      // Initialize AudioWorklet for low-latency Float32 capture
-      const blob = new Blob([workletCode], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
-
-      this.audioWorklet.addModule(url).then(() => {
-        URL.revokeObjectURL(url);
-        this._asioTapNode = new AudioWorkletNode(this, 'asio-tap-processor');
-        this._asioMasterBus.connect(this._asioTapNode);
-
-        this._asioTapNode.port.onmessage = (e) => {
-          // Stream raw 128-sample Float32 chunks directly to native ASIO driver
-          ipcRenderer.send('stream-audio-frame', Buffer.from(e.data));
-        };
-
-        console.log('[SynthHost] Native ASIO Tap Processor is LIVE and streaming!');
-        updateHUD();
-      }).catch(err => {
-        console.error('[SynthHost] Failed to load AudioWorklet module:', err);
-      });
-
-      try {
-        Object.defineProperty(this, 'baseLatency', {
-          get: () => 128 / (this.sampleRate || 48000),
-          configurable: true
-        });
-        Object.defineProperty(this, 'outputLatency', {
-          get: () => (asioStatus.ready ? asioStatus.latencySamples : 64) / (this.sampleRate || 48000),
-          configurable: true
-        });
-      } catch (e) {}
-
-      this.addEventListener('statechange', () => {
-        updateHUD();
-      });
+      console.log('[SynthHost] AudioContext instance created (sampleRate: ' + this.sampleRate + ')');
     }
   };
   window.webkitAudioContext = window.AudioContext;
 
   // Intercept all AudioNode.connect calls to redirect destination connections to our ASIO master bus
-  const origConnect = AudioNode.prototype.connect;
   AudioNode.prototype.connect = function(destination) {
-    if (destination === this.context.destination && this.context._asioMasterBus) {
-      const args = Array.from(arguments);
-      args[0] = this.context._asioMasterBus;
-      return origConnect.apply(this, args);
+    if (this._isAsioInternal) {
+      return origConnect.apply(this, arguments);
+    }
+    if (destination === this.context.destination) {
+      setupAsioPipeline(this.context);
+      if (this.context._asioMasterBus) {
+        const args = Array.from(arguments);
+        args[0] = this.context._asioMasterBus;
+        return origConnect.apply(this, args);
+      }
     }
     return origConnect.apply(this, arguments);
   };
@@ -190,10 +211,13 @@ function createLatencyHUD() {
 
       <div style="display: flex; gap: 6px; margin-top: 6px;">
         <button id="hud-reload-btn" style="flex: 1; background: #15803d; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
-          🔄 Restart Synth
+          🔄 Restart
+        </button>
+        <button id="hud-test-btn" style="flex: 1; background: #2563eb; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
+          🔊 Test Audio
         </button>
         <button id="hud-resume-btn" style="display: none; flex: 1; background: #ea580c; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
-          ▶ Click to Start Audio
+          ▶ Start
         </button>
       </div>
 
@@ -210,7 +234,38 @@ function createLatencyHUD() {
   const body = hud.querySelector('#hud-body');
   const resumeBtn = hud.querySelector('#hud-resume-btn');
   const reloadBtn = hud.querySelector('#hud-reload-btn');
+  const testBtn = hud.querySelector('#hud-test-btn');
   let isMinimized = false;
+
+  window.__playTestTone = () => {
+    if (!activeAudioContext) {
+      console.warn('[SynthHost] Cannot test audio: activeAudioContext not ready yet');
+      return false;
+    }
+    if (activeAudioContext.state === 'suspended') {
+      activeAudioContext.resume();
+    }
+    try {
+      const osc = activeAudioContext.createOscillator();
+      const gain = activeAudioContext.createGain();
+      gain.gain.value = 0.2;
+      osc.frequency.value = 440;
+      osc.connect(gain);
+      gain.connect(activeAudioContext.destination);
+      osc.start();
+      osc.stop(activeAudioContext.currentTime + 1.2);
+      console.log('[SynthHost] 🔊 Test tone triggered (440Hz, 1.2s)');
+      return true;
+    } catch (err) {
+      console.error('[SynthHost] Test tone error:', err);
+      return false;
+    }
+  };
+
+  testBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    window.__playTestTone();
+  });
 
   toggleBtn.addEventListener('click', (e) => {
     e.stopPropagation();

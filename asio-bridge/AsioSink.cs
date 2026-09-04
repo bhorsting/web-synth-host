@@ -9,22 +9,41 @@ class CircularBuffer {
     private int count = 0;
     private readonly object lockObj = new object();
 
-    // 16384 bytes = 2048 stereo Float32 frames = ~42.6 ms of maximum backlog @ 48kHz.
-    // Generous enough to never drop samples during normal playing with 256-sample ASIO buffers,
-    // yet tight enough that latency stays below 42ms even after temporary lags.
-    private readonly int maxCapacity = 16384;
+    private bool isBuffering = true;
+    private int prebufferTarget = 4096; // dynamically set to 2 ASIO buffers
+    private int maxBacklog = 12288;     // dynamically set to ~3-4 ASIO buffers (max ~25ms)
+
+    private int totalUnderruns = 0;
+    private int totalDrops = 0;
+    private long totalBytesWritten = 0;
+    private long totalBytesRead = 0;
+
+    public int TotalUnderruns { get { return totalUnderruns; } }
+    public int TotalDrops { get { return totalDrops; } }
+    public long TotalBytesWritten { get { return totalBytesWritten; } }
+    public long TotalBytesRead { get { return totalBytesRead; } }
 
     public CircularBuffer(int capacity = 65536) {
         buffer = new byte[capacity];
     }
 
+    public void ConfigureThresholds(int asioBufferBytes) {
+        lock (lockObj) {
+            // Target 2 ASIO buffers for prebuffering (e.g. 512 samples = ~10.6ms @ 48kHz for 256-sample ASIO)
+            prebufferTarget = Math.Max(asioBufferBytes * 2, 4096);
+            // Clamp backlog so latency never exceeds ~25ms
+            maxBacklog = Math.Max(prebufferTarget * 3, 16384);
+        }
+    }
+
     public void Write(byte[] data, int offset, int length) {
         if (length <= 0) return;
-        // Strictly align to 8-byte stereo Float32 frames
         int validBytes = (length / 8) * 8;
         if (validBytes <= 0) return;
 
         lock (lockObj) {
+            totalBytesWritten += validBytes;
+
             int spaceToEnd = buffer.Length - writePos;
             if (validBytes <= spaceToEnd) {
                 Buffer.BlockCopy(data, offset, buffer, writePos, validBytes);
@@ -38,24 +57,35 @@ class CircularBuffer {
 
             count += validBytes;
 
-            // Clamping backlog if queue exceeds 16KB (~42ms)
-            if (count > maxCapacity) {
-                int excess = count - maxCapacity;
+            // Clamping backlog if queue exceeds maxBacklog
+            if (count > maxBacklog) {
+                int excess = count - maxBacklog;
                 excess = (excess / 8) * 8;
                 readPos = (readPos + excess) % buffer.Length;
                 count -= excess;
+                totalDrops++;
             }
         }
     }
 
     public int Read(byte[] dest, int offset, int length) {
         lock (lockObj) {
+            if (isBuffering) {
+                if (count < prebufferTarget) {
+                    Array.Clear(dest, offset, length);
+                    return length;
+                }
+                isBuffering = false;
+            }
+
             int framesAvailable = count / 8;
             int framesRequested = length / 8;
             int framesToRead = Math.Min(framesRequested, framesAvailable);
             int bytesToRead = framesToRead * 8;
 
             if (bytesToRead > 0) {
+                totalBytesRead += bytesToRead;
+
                 int spaceToEnd = buffer.Length - readPos;
                 if (bytesToRead <= spaceToEnd) {
                     Buffer.BlockCopy(buffer, readPos, dest, offset, bytesToRead);
@@ -69,13 +99,18 @@ class CircularBuffer {
                 count -= bytesToRead;
             }
 
-            // Fill remainder with silence (zeros)
             if (bytesToRead < length) {
                 Array.Clear(dest, offset + bytesToRead, length - bytesToRead);
+                isBuffering = true;
+                totalUnderruns++;
             }
 
             return length;
         }
+    }
+
+    public int Count {
+        get { lock (lockObj) { return count; } }
     }
 }
 
@@ -112,11 +147,25 @@ class Program {
 
             using (var asio = new AsioOut(driverName)) {
                 asio.Init(provider);
+
+                int asioBufferBytes = asio.PlaybackLatency * 8;
+                if (asioBufferBytes <= 0) asioBufferBytes = 2048;
+                ring.ConfigureThresholds(asioBufferBytes);
+
                 asio.Play();
 
                 // Notify parent Electron process
                 Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":buffer=" + asio.PlaybackLatency + ":channels=" + asio.DriverOutputChannelCount);
                 Console.Out.Flush();
+
+                // Periodic stats reporter every 2.5 seconds
+                var statsTimer = new System.Timers.Timer(2500);
+                statsTimer.Elapsed += (s, e) => {
+                    Console.WriteLine("[ASIO Stats] Queue: " + ring.Count + " bytes, Written: " + ring.TotalBytesWritten + ", Read: " + ring.TotalBytesRead + ", Underruns: " + ring.TotalUnderruns + ", Drops: " + ring.TotalDrops);
+                    Console.Out.Flush();
+                };
+                statsTimer.AutoReset = true;
+                statsTimer.Start();
 
                 using (var stdin = Console.OpenStandardInput()) {
                     byte[] pipeBuf = new byte[8192];
@@ -157,3 +206,4 @@ class Program {
         }
     }
 }
+
