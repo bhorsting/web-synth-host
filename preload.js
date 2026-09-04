@@ -191,6 +191,104 @@ class AsioTapProcessor extends AudioWorkletProcessor {
 registerProcessor('asio-tap-processor', AsioTapProcessor);
 `;
 
+// ============================================================================
+// TRUE STEREO ENHANCER (ROLAND STEREO CHORUS & VOICE PAN SPREAD)
+// ============================================================================
+let stereoWideEnabled = true;
+let voicePanners = [];
+let chorusPanners = [];
+
+function applyStereoSettings(engine) {
+  if (!engine || !engine.ctx || !engine.masterBus) return;
+  const ctx = engine.ctx;
+
+  // 1. Roland Stereo Chorus setup (Pan Delay 1 Left, Delay 2 Right, Delay 3 Center)
+  if (chorusPanners.length === 0 && engine.chorusGain) {
+    try {
+      const panC1 = ctx.createStereoPanner();
+      panC1._isAsioInternal = true;
+      const panC2 = ctx.createStereoPanner();
+      panC2._isAsioInternal = true;
+      const panC3 = ctx.createStereoPanner();
+      panC3._isAsioInternal = true;
+      chorusPanners = [panC1, panC2, panC3];
+
+      engine.chorusGain.disconnect();
+      engine.chorusGain.connect(panC1);
+      panC1.connect(engine.masterBus);
+
+      if (engine.chorus2Gain) {
+        engine.chorus2Gain.disconnect();
+        engine.chorus2Gain.connect(panC2);
+        panC2.connect(engine.masterBus);
+      }
+      if (engine.chorus3Gain) {
+        engine.chorus3Gain.disconnect();
+        engine.chorus3Gain.connect(panC3);
+        panC3.connect(engine.masterBus);
+      }
+      console.log('[SynthHost] 🎧 True Roland Stereo Chorus initialized');
+    } catch (e) {
+      console.warn('[SynthHost] Chorus panner setup notice:', e);
+    }
+  }
+
+  if (chorusPanners.length >= 3) {
+    try {
+      chorusPanners[0].pan.setValueAtTime(stereoWideEnabled ? -0.85 : 0.0, ctx.currentTime);
+      chorusPanners[1].pan.setValueAtTime(stereoWideEnabled ? 0.85 : 0.0, ctx.currentTime);
+      chorusPanners[2].pan.setValueAtTime(0.0, ctx.currentTime);
+    } catch (e) {}
+  }
+
+  // 2. Polyphonic Voice Pan Spread setup
+  const pans = [-0.35, 0.35, -0.20, 0.20, -0.10, 0.10, -0.30, 0.30];
+  if (engine.voices && Array.isArray(engine.voices) && engine.mainGain) {
+    if (voicePanners.length !== engine.voices.length) {
+      voicePanners = [];
+      for (let i = 0; i < engine.voices.length; i++) {
+        const v = engine.voices[i];
+        try {
+          v.output.disconnect();
+          const panner = ctx.createStereoPanner();
+          panner._isAsioInternal = true;
+          panner.pan.value = stereoWideEnabled ? pans[i % pans.length] : 0.0;
+          v.output.connect(panner);
+          panner.connect(engine.mainGain);
+          voicePanners.push(panner);
+        } catch (e) {}
+      }
+      console.log('[SynthHost] 🎹 Polyphonic Voice Pan Spread initialized (' + voicePanners.length + ' voices)');
+    } else {
+      for (let i = 0; i < voicePanners.length; i++) {
+        try {
+          voicePanners[i].pan.setValueAtTime(stereoWideEnabled ? pans[i % pans.length] : 0.0, ctx.currentTime);
+        } catch (e) {}
+      }
+    }
+  }
+}
+
+// Hook window.jupiterEngine assignment
+let engineInstance = null;
+Object.defineProperty(window, 'jupiterEngine', {
+  get: () => engineInstance,
+  set: (val) => {
+    engineInstance = val;
+    if (val) {
+      setTimeout(() => applyStereoSettings(val), 50);
+    }
+  },
+  configurable: true
+});
+
+// Periodic maintenance check for engine and voice recreation
+setInterval(() => {
+  if (window.jupiterEngine) {
+    applyStereoSettings(window.jupiterEngine);
+  }
+}, 1000);
+
 // Intercept AudioContext to attach the high-speed ASIO tap
 const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
 if (OriginalAudioContext) {
@@ -397,8 +495,11 @@ function createLatencyHUD() {
         <button id="hud-test-btn" style="flex: 1; background: #2563eb; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
           🔊 Test Audio
         </button>
-        <button id="hud-auth-btn" style="flex: 1.2; background: #7c3aed; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
+        <button id="hud-auth-btn" style="flex: 1.1; background: #7c3aed; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
           🌐 Google Auth
+        </button>
+        <button id="hud-stereo-btn" style="flex: 1.2; background: #0891b2; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;" title="Toggle between Wide Stereo and Dual Mono">
+          🎧 Stereo: WIDE
         </button>
         <button id="hud-resume-btn" style="display: none; flex: 1; background: #ea580c; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
           ▶ Start
@@ -420,7 +521,18 @@ function createLatencyHUD() {
   const reloadBtn = hud.querySelector('#hud-reload-btn');
   const testBtn = hud.querySelector('#hud-test-btn');
   const authBtn = hud.querySelector('#hud-auth-btn');
+  const stereoBtn = hud.querySelector('#hud-stereo-btn');
   let isMinimized = false;
+
+  stereoBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    stereoWideEnabled = !stereoWideEnabled;
+    stereoBtn.textContent = stereoWideEnabled ? '🎧 Stereo: WIDE' : '🎧 Stereo: DUAL MONO';
+    stereoBtn.style.background = stereoWideEnabled ? '#0891b2' : '#4b5563';
+    if (window.jupiterEngine) {
+      applyStereoSettings(window.jupiterEngine);
+    }
+  });
 
   authBtn.addEventListener('click', (e) => {
     e.stopPropagation();
