@@ -125,7 +125,7 @@ function startLocalOAuthServer() {
       return;
     }
 
-    const parsedUrl = new URL(req.url, `http://127.0.0.1:${OAUTH_PORT}`);
+    const parsedUrl = new URL(req.url, `http://localhost:${OAUTH_PORT}`);
 
     if (parsedUrl.pathname === '/callback') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -232,8 +232,8 @@ function startLocalOAuthServer() {
     res.end();
   });
 
-  localAuthServer.listen(OAUTH_PORT, '127.0.0.1', () => {
-    console.log(`[SynthHost] Local OAuth loopback receiver listening on http://127.0.0.1:${OAUTH_PORT}`);
+  localAuthServer.listen(OAUTH_PORT, () => {
+    console.log(`[SynthHost] Local OAuth loopback receiver listening on http://localhost:${OAUTH_PORT}`);
   });
 
   localAuthServer.on('error', (err) => {
@@ -298,7 +298,7 @@ ipcMain.handle('clear-google-token', () => {
 });
 
 ipcMain.handle('open-browser-auth', () => {
-  const redirectUri = `http://127.0.0.1:${OAUTH_PORT}/callback`;
+  const redirectUri = `http://localhost:${OAUTH_PORT}/callback`;
   const scopes = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive.file',
