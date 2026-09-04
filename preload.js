@@ -21,30 +21,32 @@ const workletCode = `
 class AsioTapProcessor extends AudioWorkletProcessor {
   process(inputs, outputs, parameters) {
     const input = inputs[0];
-    if (input && input.length >= 2 && input[0] && input[0].length > 0) {
-      const left = input[0];
-      const right = input[1];
-      const len = left.length;
-      const interleaved = new Float32Array(len * 2);
+    const len = 128;
+    const interleaved = new Float32Array(len * 8);
+
+    if (input && input.length > 0 && input[0] && input[0].length > 0) {
+      const ch0 = input[0];
+      const ch1 = input.length > 1 ? input[1] : input[0];
+      const ch2 = input.length > 2 ? input[2] : null;
+      const ch3 = input.length > 3 ? input[3] : null;
+      const ch4 = input.length > 4 ? input[4] : null;
+      const ch5 = input.length > 5 ? input[5] : null;
+      const ch6 = input.length > 6 ? input[6] : null;
+      const ch7 = input.length > 7 ? input[7] : null;
+
       for (let i = 0; i < len; i++) {
-        interleaved[i * 2] = left[i];
-        interleaved[i * 2 + 1] = right[i];
+        interleaved[i * 8 + 0] = ch0 ? ch0[i] : 0;
+        interleaved[i * 8 + 1] = ch1 ? ch1[i] : 0;
+        interleaved[i * 8 + 2] = ch2 ? ch2[i] : 0;
+        interleaved[i * 8 + 3] = ch3 ? ch3[i] : 0;
+        interleaved[i * 8 + 4] = ch4 ? ch4[i] : 0;
+        interleaved[i * 8 + 5] = ch5 ? ch5[i] : 0;
+        interleaved[i * 8 + 6] = ch6 ? ch6[i] : 0;
+        interleaved[i * 8 + 7] = ch7 ? ch7[i] : 0;
       }
-      this.port.postMessage(interleaved.buffer, [interleaved.buffer]);
-    } else if (input && input.length === 1 && input[0] && input[0].length > 0) {
-      const mono = input[0];
-      const len = mono.length;
-      const interleaved = new Float32Array(len * 2);
-      for (let i = 0; i < len; i++) {
-        interleaved[i * 2] = mono[i];
-        interleaved[i * 2 + 1] = mono[i];
-      }
-      this.port.postMessage(interleaved.buffer, [interleaved.buffer]);
-    } else {
-      // Continuous silence keeps ASIO clock and ring buffer in steady sync
-      const silent = new Float32Array(256);
-      this.port.postMessage(silent.buffer, [silent.buffer]);
     }
+
+    this.port.postMessage(interleaved.buffer, [interleaved.buffer]);
     return true;
   }
 }
@@ -60,44 +62,66 @@ if (OriginalAudioContext) {
     if (ctx._asioInitialized) return;
     ctx._asioInitialized = true;
 
-    console.log('[SynthHost] Primary Playback AudioContext identified! Attaching Native ASIO Tap...');
+    console.log('[SynthHost] Primary Playback AudioContext identified! Attaching 8-Channel Native ASIO Tap...');
     activeAudioContext = ctx;
     window.__activeAudioContext = ctx;
 
-    // Master bus that receives all synth output intended for destination
+    // Master bus configured for 8 discrete channels (Ch 0/1: Synth, Ch 4/5: Click, Ch 2/3/6/7: Aux/Surround)
     ctx._asioMasterBus = ctx.createGain();
     ctx._asioMasterBus._isAsioInternal = true;
+    ctx._asioMasterBus.channelCount = 8;
+    ctx._asioMasterBus.channelCountMode = 'explicit';
+    ctx._asioMasterBus.channelInterpretation = 'discrete';
 
     // Muted destination connection to pull the audio graph through Chromium's hardware clock
     const silentSink = ctx.createGain();
     silentSink._isAsioInternal = true;
+    silentSink.channelCount = 8;
+    silentSink.channelCountMode = 'explicit';
+    silentSink.channelInterpretation = 'discrete';
     silentSink.gain.value = 0.0;
     origConnect.call(ctx._asioMasterBus, silentSink);
     origConnect.call(silentSink, ctx.destination);
 
-    // Initialize AudioWorklet for low-latency Float32 capture
+    // Initialize AudioWorklet for low-latency 8-channel Float32 capture
     const blob = new Blob([workletCode], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
 
     ctx.audioWorklet.addModule(url).then(() => {
       URL.revokeObjectURL(url);
-      ctx._asioTapNode = new AudioWorkletNode(ctx, 'asio-tap-processor');
+      ctx._asioTapNode = new AudioWorkletNode(ctx, 'asio-tap-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [8],
+        channelCount: 8,
+        channelCountMode: 'explicit',
+        channelInterpretation: 'discrete'
+      });
       ctx._asioTapNode._isAsioInternal = true;
       origConnect.call(ctx._asioMasterBus, ctx._asioTapNode);
       origConnect.call(ctx._asioTapNode, silentSink); // Ensures Blink pulls this node every quantum
 
       ctx._asioTapNode.port.onmessage = (e) => {
-        // Stream raw 128-sample Float32 chunks directly to native ASIO driver
+        // Stream raw 128-sample 8-channel Float32 chunks directly to native ASIO driver
         ipcRenderer.send('stream-audio-frame', Buffer.from(e.data));
       };
 
-      console.log('[SynthHost] Native ASIO Tap Processor is LIVE and streaming cleanly!');
+      console.log('[SynthHost] Native 8-Channel ASIO Tap Processor is LIVE and streaming cleanly!');
       updateHUD();
     }).catch(err => {
       console.error('[SynthHost] Failed to load AudioWorklet module:', err);
     });
 
     try {
+      Object.defineProperty(ctx.destination, 'maxChannelCount', {
+        get: () => 8,
+        configurable: true
+      });
+      Object.defineProperty(ctx.destination, 'channelCount', {
+        get: () => 8,
+        set: () => {},
+        configurable: true
+      });
       Object.defineProperty(ctx, 'baseLatency', {
         get: () => 128 / (ctx.sampleRate || 48000),
         configurable: true
@@ -205,6 +229,9 @@ function createLatencyHUD() {
         <span style="color: #9ca3af;">Sample Rate:</span>
         <span id="hud-sample-rate" style="color: #fff; text-align: right;">48,000 Hz</span>
 
+        <span style="color: #9ca3af;">Channels:</span>
+        <span id="hud-channels" style="color: #a78bfa; font-weight: 600; text-align: right;">8 Ch (1/2 Synth, 5/6 Click)</span>
+
         <span style="color: #9ca3af;">ASIO Status:</span>
         <span id="hud-asio-status" style="color: #4ade80; font-weight: 600; text-align: right;">ACTIVE (64s)</span>
       </div>
@@ -223,7 +250,7 @@ function createLatencyHUD() {
 
       <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid rgba(255, 255, 255, 0.08); font-size: 9px; color: #86efac; display: flex; justify-content: space-between;">
         <span>F11 / Esc: Fullscreen</span>
-        <span>Bypassed Chrome 128ms!</span>
+        <span>Out 1/2: Synth | Out 5/6: Click</span>
       </div>
     </div>
   `;
@@ -246,15 +273,43 @@ function createLatencyHUD() {
       activeAudioContext.resume();
     }
     try {
-      const osc = activeAudioContext.createOscillator();
-      const gain = activeAudioContext.createGain();
-      gain.gain.value = 0.2;
-      osc.frequency.value = 440;
-      osc.connect(gain);
-      gain.connect(activeAudioContext.destination);
-      osc.start();
-      osc.stop(activeAudioContext.currentTime + 1.2);
-      console.log('[SynthHost] 🔊 Test tone triggered (440Hz, 1.2s)');
+      const merger = activeAudioContext.createChannelMerger(8);
+      merger._isAsioInternal = true;
+      merger.channelCountMode = 'explicit';
+      merger.channelInterpretation = 'discrete';
+      origConnect.call(merger, activeAudioContext._asioMasterBus);
+
+      // Tone 1: Synth audio (440 Hz) on Channels 0 & 1 (ESI Out 1 & 2)
+      const oscSynth = activeAudioContext.createOscillator();
+      const gainSynth = activeAudioContext.createGain();
+      gainSynth._isAsioInternal = true;
+      gainSynth.gain.value = 0.2;
+      oscSynth.frequency.value = 440;
+      origConnect.call(oscSynth, gainSynth);
+      origConnect.call(gainSynth, merger, 0, 0); // Out 1 (L)
+      origConnect.call(gainSynth, merger, 0, 1); // Out 2 (R)
+
+      // Tone 2: Click track (880 Hz beep) on Channels 4 & 5 (ESI Out 5 & 6)
+      const oscClick = activeAudioContext.createOscillator();
+      const gainClick = activeAudioContext.createGain();
+      gainClick._isAsioInternal = true;
+      gainClick.gain.value = 0.25;
+      oscClick.frequency.value = 880;
+      origConnect.call(oscClick, gainClick);
+      origConnect.call(gainClick, merger, 0, 4); // Out 5 (Click L)
+      origConnect.call(gainClick, merger, 0, 5); // Out 6 (Click R)
+
+      const now = activeAudioContext.currentTime;
+      oscSynth.start(now);
+      oscSynth.stop(now + 1.2);
+      oscClick.start(now);
+      oscClick.stop(now + 1.2);
+
+      setTimeout(() => {
+        try { merger.disconnect(); } catch {}
+      }, 1500);
+
+      console.log('[SynthHost] 🔊 Multi-channel test tone: Ch 1/2 (Out 1/2) 440Hz, Ch 5/6 (Out 5/6 Click) 880Hz');
       return true;
     } catch (err) {
       console.error('[SynthHost] Test tone error:', err);

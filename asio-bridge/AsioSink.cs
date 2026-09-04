@@ -9,9 +9,12 @@ class CircularBuffer {
     private int count = 0;
     private readonly object lockObj = new object();
 
+    // 8 channels * 4 bytes/float = 32 bytes per 8-channel frame
+    private const int FrameBytes = 32;
+
     private bool isBuffering = true;
-    private int prebufferTarget = 4096; // dynamically set to 2 ASIO buffers
-    private int maxBacklog = 12288;     // dynamically set to ~3-4 ASIO buffers (max ~25ms)
+    private int prebufferTarget = 16384; // 2 ASIO buffers of 256 frames (512 frames @ 32 bytes = 16384 bytes = 10.66ms)
+    private int maxBacklog = 49152;      // ~3x prebuffer target (max ~32ms latency)
 
     private int totalUnderruns = 0;
     private int totalDrops = 0;
@@ -23,22 +26,22 @@ class CircularBuffer {
     public long TotalBytesWritten { get { return totalBytesWritten; } }
     public long TotalBytesRead { get { return totalBytesRead; } }
 
-    public CircularBuffer(int capacity = 65536) {
+    public CircularBuffer(int capacity = 131072) {
         buffer = new byte[capacity];
     }
 
     public void ConfigureThresholds(int asioBufferBytes) {
         lock (lockObj) {
-            // Target 2 ASIO buffers for prebuffering (e.g. 512 samples = ~10.6ms @ 48kHz for 256-sample ASIO)
-            prebufferTarget = Math.Max(asioBufferBytes * 2, 4096);
-            // Clamp backlog so latency never exceeds ~25ms
-            maxBacklog = Math.Max(prebufferTarget * 3, 16384);
+            // Target 2 ASIO buffers for prebuffering (~10.6ms @ 48kHz for 256-frame ASIO)
+            prebufferTarget = Math.Max(asioBufferBytes * 2, 8192);
+            // Clamp backlog so latency never creeps
+            maxBacklog = Math.Max(prebufferTarget * 3, 49152);
         }
     }
 
     public void Write(byte[] data, int offset, int length) {
         if (length <= 0) return;
-        int validBytes = (length / 8) * 8;
+        int validBytes = (length / FrameBytes) * FrameBytes;
         if (validBytes <= 0) return;
 
         lock (lockObj) {
@@ -60,7 +63,7 @@ class CircularBuffer {
             // Clamping backlog if queue exceeds maxBacklog
             if (count > maxBacklog) {
                 int excess = count - maxBacklog;
-                excess = (excess / 8) * 8;
+                excess = (excess / FrameBytes) * FrameBytes;
                 readPos = (readPos + excess) % buffer.Length;
                 count -= excess;
                 totalDrops++;
@@ -78,10 +81,10 @@ class CircularBuffer {
                 isBuffering = false;
             }
 
-            int framesAvailable = count / 8;
-            int framesRequested = length / 8;
+            int framesAvailable = count / FrameBytes;
+            int framesRequested = length / FrameBytes;
             int framesToRead = Math.Min(framesRequested, framesAvailable);
-            int bytesToRead = framesToRead * 8;
+            int bytesToRead = framesToRead * FrameBytes;
 
             if (bytesToRead > 0) {
                 totalBytesRead += bytesToRead;
@@ -119,7 +122,7 @@ class AsioStreamProvider : IWaveProvider {
     private readonly CircularBuffer circularBuffer;
 
     public AsioStreamProvider(int sampleRate, CircularBuffer buffer) {
-        this.waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, 2);
+        this.waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, 8);
         this.circularBuffer = buffer;
     }
 
@@ -148,20 +151,21 @@ class Program {
             using (var asio = new AsioOut(driverName)) {
                 asio.Init(provider);
 
-                int asioBufferBytes = asio.PlaybackLatency * 8;
-                if (asioBufferBytes <= 0) asioBufferBytes = 2048;
+                // For 8 channels: asio.PlaybackLatency samples * 8 channels * 4 bytes
+                int asioBufferBytes = asio.PlaybackLatency * 8 * 4;
+                if (asioBufferBytes <= 0) asioBufferBytes = 8192;
                 ring.ConfigureThresholds(asioBufferBytes);
 
                 asio.Play();
 
                 // Notify parent Electron process
-                Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":buffer=" + asio.PlaybackLatency + ":channels=" + asio.DriverOutputChannelCount);
+                Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":buffer=" + asio.PlaybackLatency + ":channels=" + asio.NumberOfOutputChannels);
                 Console.Out.Flush();
 
                 // Periodic stats reporter every 2.5 seconds
                 var statsTimer = new System.Timers.Timer(2500);
                 statsTimer.Elapsed += (s, e) => {
-                    Console.WriteLine("[ASIO Stats] Queue: " + ring.Count + " bytes, Written: " + ring.TotalBytesWritten + ", Read: " + ring.TotalBytesRead + ", Underruns: " + ring.TotalUnderruns + ", Drops: " + ring.TotalDrops);
+                    Console.WriteLine("[ASIO Stats] Queue: " + ring.Count + " bytes (" + (ring.Count / 32) + " frames), Written: " + ring.TotalBytesWritten + ", Read: " + ring.TotalBytesRead + ", Underruns: " + ring.TotalUnderruns + ", Drops: " + ring.TotalDrops);
                     Console.Out.Flush();
                 };
                 statsTimer.AutoReset = true;
@@ -169,7 +173,7 @@ class Program {
 
                 using (var stdin = Console.OpenStandardInput()) {
                     byte[] pipeBuf = new byte[8192];
-                    byte[] comboBuf = new byte[8192 + 8];
+                    byte[] comboBuf = new byte[8192 + 32];
                     int remainder = 0;
 
                     int bytesRead;
@@ -177,7 +181,7 @@ class Program {
                         if (remainder > 0) {
                             Buffer.BlockCopy(pipeBuf, 0, comboBuf, remainder, bytesRead);
                             int total = remainder + bytesRead;
-                            int valid = (total / 8) * 8;
+                            int valid = (total / 32) * 32;
                             int newRem = total - valid;
 
                             ring.Write(comboBuf, 0, valid);
@@ -187,7 +191,7 @@ class Program {
                             }
                             remainder = newRem;
                         } else {
-                            int valid = (bytesRead / 8) * 8;
+                            int valid = (bytesRead / 32) * 32;
                             int newRem = bytesRead - valid;
 
                             ring.Write(pipeBuf, 0, valid);
@@ -206,4 +210,5 @@ class Program {
         }
     }
 }
+
 
