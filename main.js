@@ -22,7 +22,7 @@ function startAsioSink() {
 
   try {
     asioProcess = spawn(asioExe, [], {
-      stdio: ['pipe', 'pipe', 'inherit'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true
     });
 
@@ -49,13 +49,28 @@ function startAsioSink() {
       }
     });
 
+    asioProcess.stderr.on('data', (chunk) => {
+      const errStr = chunk.toString().trim();
+      console.error('[ASIO Bridge Error]', errStr);
+      asioStatus.error = errStr;
+      asioStatus.ready = false;
+      if (mainWindow && mainWindow.webContents) {
+        mainWindow.webContents.send('asio-status-update', asioStatus);
+      }
+    });
+
     asioProcess.on('exit', (code) => {
       console.log('[ASIO Bridge] Process exited with code:', code);
       asioStatus.ready = false;
       asioProcess = null;
+      if (mainWindow && mainWindow.webContents) {
+        mainWindow.webContents.send('asio-status-update', asioStatus);
+      }
     });
   } catch (err) {
     console.error('[ASIO Bridge] Failed to launch:', err);
+    asioStatus.error = err.message;
+    asioStatus.ready = false;
   }
 }
 
@@ -67,6 +82,16 @@ ipcMain.on('stream-audio-frame', (event, buffer) => {
 });
 
 ipcMain.handle('get-asio-status', () => asioStatus);
+ipcMain.handle('restart-asio', () => {
+  if (asioProcess) {
+    try {
+      asioProcess.kill();
+    } catch {}
+    asioProcess = null;
+  }
+  startAsioSink();
+  return asioStatus;
+});
 
 function createWindow() {
   console.log('[SynthHost] Creating BrowserWindow in Fullscreen...');
@@ -100,6 +125,9 @@ function createWindow() {
 
   mainWindow.webContents.on('did-finish-load', () => {
     console.log('[SynthHost] Synth page loaded successfully!');
+    if (mainWindow && mainWindow.webContents) {
+      mainWindow.webContents.send('asio-status-update', asioStatus);
+    }
   });
 
   // Keyboard shortcuts: F11 or Escape to toggle Fullscreen, F12 for DevTools

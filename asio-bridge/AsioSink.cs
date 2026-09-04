@@ -115,7 +115,7 @@ class Program {
                 asio.Play();
 
                 // Notify parent Electron process
-                Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":channels=" + asio.DriverOutputChannelCount);
+                Console.WriteLine("ASIO_READY:latency=" + asio.PlaybackLatency + ":buffer=" + asio.PlaybackLatency + ":channels=" + asio.DriverOutputChannelCount);
                 Console.Out.Flush();
 
                 using (var stdin = Console.OpenStandardInput()) {

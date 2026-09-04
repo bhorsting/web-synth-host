@@ -228,7 +228,9 @@ function createLatencyHUD() {
 
   reloadBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    window.location.reload();
+    ipcRenderer.invoke('restart-asio').then(() => {
+      window.location.reload();
+    });
   });
 }
 
@@ -261,6 +263,11 @@ function updateHUD() {
       elStatus.textContent = `STREAMING (${hwFrames}s)`;
       elStatus.style.color = '#4ade80';
       if (elDot) elDot.style.background = '#22c55e';
+    } else if (asioStatus.error) {
+      elStatus.textContent = `ERR: ${asioStatus.error.substring(0, 18)}`;
+      elStatus.title = asioStatus.error;
+      elStatus.style.color = '#ef4444';
+      if (elDot) elDot.style.background = '#ef4444';
     } else {
       elStatus.textContent = 'CONNECTING...';
       elStatus.style.color = '#facc15';
