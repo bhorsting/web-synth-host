@@ -174,11 +174,11 @@ function createLatencyHUD() {
   });
 
   deviceSelect.addEventListener('change', async (e) => {
-    const deviceId = e.target.value;
+    const deviceId = e.target.value === 'default' ? '' : e.target.value;
     if (activeAudioContext && typeof activeAudioContext.setSinkId === 'function') {
       try {
         await activeAudioContext.setSinkId(deviceId);
-        console.log('[SynthHost] Switched audio output device to:', deviceId);
+        console.log('[SynthHost] Switched audio output device to:', deviceId || 'default');
         updateHUD();
       } catch (err) {
         console.error('[SynthHost] Failed to setSinkId:', err);
@@ -224,21 +224,19 @@ async function populateDeviceList() {
         hasVoicemeeter = true;
       }
       if (lower.includes('esi') || lower.includes('u168')) {
-        esiDevice = dev;
         opt.textContent = `⭐ ${label}`;
+        // Prioritize default or main speakers 1&2, do not overwrite with sub-channels
+        if (!esiDevice || dev.deviceId === 'default' || lower.includes('luidsprekers') || lower.includes('01&02')) {
+          esiDevice = dev;
+        }
       }
       select.appendChild(opt);
     });
 
-    // Auto-select ESI device if found and not yet selected
-    if (esiDevice) {
-      if (!currentVal || currentVal === 'default' || currentVal.includes('default')) {
-        select.value = esiDevice.deviceId;
-        if (activeAudioContext && typeof activeAudioContext.setSinkId === 'function') {
-          activeAudioContext.setSinkId(esiDevice.deviceId).then(updateHUD).catch(console.error);
-        }
-      }
-    } else if (currentVal && Array.from(select.options).some(o => o.value === currentVal)) {
+    // Default to the system default device (which is Luidsprekers ESI U168XT) to keep WASAPI Exclusive mode
+    if (!currentVal || currentVal === 'default') {
+      select.value = 'default';
+    } else if (Array.from(select.options).some(o => o.value === currentVal)) {
       select.value = currentVal;
     }
 
