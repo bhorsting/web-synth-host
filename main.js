@@ -1,5 +1,7 @@
-const { app, BrowserWindow, powerSaveBlocker, session, ipcMain } = require('electron');
+const { app, BrowserWindow, powerSaveBlocker, session, ipcMain, shell } = require('electron');
 const path = require('path');
+const http = require('http');
+const fs = require('fs');
 const { spawn } = require('child_process');
 
 // ============================================================================
@@ -96,6 +98,223 @@ ipcMain.handle('restart-asio', () => {
   }
   startAsioSink();
   return asioStatus;
+});
+
+// ============================================================================
+// SYSTEM BROWSER GOOGLE OAUTH 2.0 BRIDGE (LOOPBACK RECEIVER)
+// ============================================================================
+
+let localAuthServer = null;
+let cachedGoogleToken = null;
+let cachedGoogleTokenTime = 0;
+const OAUTH_PORT = 48480;
+const OAUTH_CLIENT_ID = '693154064316-8dhof576j828lunjt0o3nbed263tecad.apps.googleusercontent.com';
+
+function startLocalOAuthServer() {
+  if (localAuthServer) return;
+
+  localAuthServer = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const parsedUrl = new URL(req.url, `http://127.0.0.1:${OAUTH_PORT}`);
+
+    if (parsedUrl.pathname === '/callback') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Jupiter-8 Synth Host - Authorization</title>
+  <style>
+    body {
+      background: #0a0a0f;
+      color: #f3f4f6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+      text-align: center;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #374151;
+      border-radius: 12px;
+      padding: 32px 40px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      max-width: 440px;
+    }
+    h2 { margin: 0 0 12px 0; font-size: 20px; color: #4ade80; }
+    p { margin: 0; font-size: 14px; color: #9ca3af; line-height: 1.6; }
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: #4ade80;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 16px auto 0 auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card" id="content">
+    <h2>Authorizing Synth Host...</h2>
+    <p>Connecting your Google Account to the Jupiter-8 Synth...</p>
+    <div class="spinner" id="spinner"></div>
+  </div>
+  <script>
+    const hash = window.location.hash.substring(1);
+    const params = new URLSearchParams(hash);
+    const token = params.get('access_token');
+    const error = params.get('error');
+
+    if (token) {
+      fetch('/token?token=' + encodeURIComponent(token))
+        .then(r => r.json())
+        .then(() => {
+          document.getElementById('content').innerHTML =
+            '<h2 style="color: #4ade80;">Authorization Successful!</h2>' +
+            '<p>Your Google Sheets library is now connected.<br>You can close this browser tab and return to the synth.</p>';
+          setTimeout(() => { try { window.close(); } catch(e){} }, 2000);
+        })
+        .catch(err => {
+          document.getElementById('content').innerHTML =
+            '<h2 style="color: #ef4444;">Error Sending Token</h2>' +
+            '<p>' + err.message + '</p>';
+        });
+    } else if (error) {
+      document.getElementById('content').innerHTML =
+        '<h2 style="color: #ef4444;">Authorization Cancelled</h2>' +
+        '<p>' + (params.get('error_description') || error) + '</p>';
+    } else {
+      document.getElementById('content').innerHTML =
+        '<h2 style="color: #facc15;">No Token Received</h2>' +
+        '<p>Please try clicking Authorize again in the synth host.</p>';
+    }
+  </script>
+</body>
+</html>`);
+      return;
+    }
+
+    if (parsedUrl.pathname === '/token') {
+      const token = parsedUrl.searchParams.get('token');
+      if (token) {
+        saveGoogleToken(token);
+        if (mainWindow && mainWindow.webContents) {
+          console.log('[SynthHost] Google OAuth access token successfully received from browser!');
+          mainWindow.webContents.send('google-token-received', token);
+          try {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+          } catch (e) {}
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  localAuthServer.listen(OAUTH_PORT, '127.0.0.1', () => {
+    console.log(`[SynthHost] Local OAuth loopback receiver listening on http://127.0.0.1:${OAUTH_PORT}`);
+  });
+
+  localAuthServer.on('error', (err) => {
+    console.warn('[SynthHost] Local OAuth server notice:', err.message);
+  });
+}
+
+function getTokenFilePath() {
+  return path.join(app.getPath('userData'), 'google-oauth-token.json');
+}
+
+function loadStoredGoogleToken() {
+  try {
+    const p = getTokenFilePath();
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (data.token && data.time && (Date.now() - data.time < 55 * 60 * 1000)) {
+        cachedGoogleToken = data.token;
+        cachedGoogleTokenTime = data.time;
+        console.log('[SynthHost] Loaded valid cached Google OAuth token from disk');
+      } else {
+        console.log('[SynthHost] Saved Google OAuth token on disk is expired');
+        try { fs.unlinkSync(p); } catch {}
+      }
+    }
+  } catch (e) {
+    console.warn('[SynthHost] Error loading cached token:', e.message);
+  }
+}
+
+function saveGoogleToken(token) {
+  cachedGoogleToken = token;
+  cachedGoogleTokenTime = Date.now();
+  try {
+    fs.writeFileSync(getTokenFilePath(), JSON.stringify({ token, time: cachedGoogleTokenTime }), 'utf8');
+    console.log('[SynthHost] Cached Google OAuth token saved to disk');
+  } catch (e) {
+    console.warn('[SynthHost] Error saving cached token:', e.message);
+  }
+}
+
+function clearGoogleToken() {
+  cachedGoogleToken = null;
+  cachedGoogleTokenTime = 0;
+  try {
+    const p = getTokenFilePath();
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+    console.log('[SynthHost] Google OAuth token cleared from disk');
+  } catch (e) {}
+}
+
+ipcMain.handle('get-google-token', () => {
+  if (cachedGoogleToken && (Date.now() - cachedGoogleTokenTime < 55 * 60 * 1000)) {
+    return cachedGoogleToken;
+  }
+  return null;
+});
+
+ipcMain.handle('clear-google-token', () => {
+  clearGoogleToken();
+  return true;
+});
+
+ipcMain.handle('open-browser-auth', () => {
+  const redirectUri = `http://127.0.0.1:${OAUTH_PORT}/callback`;
+  const scopes = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive.readonly'
+  ].join(' ');
+
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+    `client_id=${encodeURIComponent(OAUTH_CLIENT_ID)}&` +
+    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+    `response_type=token&` +
+    `scope=${encodeURIComponent(scopes)}&` +
+    `prompt=select_account`;
+
+  console.log('[SynthHost] Launching system browser for Google OAuth flow...');
+  shell.openExternal(authUrl);
+  return { started: true };
 });
 
 function createWindow() {
@@ -204,11 +423,19 @@ app.whenReady().then(() => {
     callback({ cancel: false, requestHeaders: details.requestHeaders });
   });
 
+  startLocalOAuthServer();
+  loadStoredGoogleToken();
   startAsioSink();
   createWindow();
 });
 
 app.on('window-all-closed', () => {
+  if (localAuthServer) {
+    try {
+      localAuthServer.close();
+    } catch {}
+    localAuthServer = null;
+  }
   if (asioProcess) {
     try {
       asioProcess.stdin.end();

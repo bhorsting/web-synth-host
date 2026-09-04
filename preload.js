@@ -17,6 +17,90 @@ ipcRenderer.invoke('get-asio-status').then(status => {
   updateHUD();
 });
 
+// ============================================================================
+// SYSTEM BROWSER GOOGLE OAUTH 2.0 BRIDGE
+// ============================================================================
+
+let currentGoogleAuthCallback = null;
+let savedGoogleToken = null;
+
+// Retrieve cached token from Electron main process
+ipcRenderer.invoke('get-google-token').then(token => {
+  if (token) {
+    savedGoogleToken = token;
+    console.log('[SynthHost] Acquired active Google OAuth token from main process');
+    updateHUD();
+  }
+});
+
+// Listen for token received from Electron main process loopback server (via Chrome)
+ipcRenderer.on('google-token-received', (event, token) => {
+  console.log('[SynthHost] Google OAuth access token received in renderer via browser flow!');
+  savedGoogleToken = token;
+  updateHUD();
+
+  if (currentGoogleAuthCallback) {
+    const cb = currentGoogleAuthCallback;
+    currentGoogleAuthCallback = null;
+    cb({
+      access_token: token,
+      expires_in: 3600,
+      token_type: 'Bearer',
+      scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly'
+    });
+  }
+});
+
+// Intercept Google Identity Services initTokenClient to use the system browser
+function hookGoogleIdentityServices() {
+  const checkInterval = setInterval(() => {
+    if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+      if (window.google.accounts.oauth2._isHooked) {
+        clearInterval(checkInterval);
+        return;
+      }
+      window.google.accounts.oauth2._isHooked = true;
+      clearInterval(checkInterval);
+
+      const origInit = window.google.accounts.oauth2.initTokenClient;
+      window.google.accounts.oauth2.initTokenClient = function(config) {
+        console.log('[SynthHost] Intercepted google.accounts.oauth2.initTokenClient');
+
+        return {
+          requestAccessToken: function(opts) {
+            console.log('[SynthHost] requestAccessToken triggered by web synth');
+
+            // If we already have a valid token saved, supply it immediately
+            if (savedGoogleToken) {
+              console.log('[SynthHost] Supplying active Google token to synth callback!');
+              if (config && typeof config.callback === 'function') {
+                setTimeout(() => {
+                  config.callback({
+                    access_token: savedGoogleToken,
+                    expires_in: 3600,
+                    token_type: 'Bearer',
+                    scope: config.scope || 'https://www.googleapis.com/auth/spreadsheets'
+                  });
+                }, 20);
+                return;
+              }
+            }
+
+            // Otherwise, open system browser for 1-click Google sign-in!
+            console.log('[SynthHost] Requesting OAuth authorization via system browser...');
+            currentGoogleAuthCallback = config ? config.callback : null;
+            ipcRenderer.invoke('open-browser-auth');
+          }
+        };
+      };
+
+      console.log('[SynthHost] Google Identity Services successfully hooked for system browser OAuth!');
+    }
+  }, 50);
+}
+
+hookGoogleIdentityServices();
+
 const workletCode = `
 class AsioTapProcessor extends AudioWorkletProcessor {
   process(inputs, outputs, parameters) {
@@ -234,16 +318,22 @@ function createLatencyHUD() {
 
         <span style="color: #9ca3af;">ASIO Status:</span>
         <span id="hud-asio-status" style="color: #4ade80; font-weight: 600; text-align: right;">ACTIVE (64s)</span>
+
+        <span style="color: #9ca3af;">Google Sheets:</span>
+        <span id="hud-google-status" style="color: #facc15; font-weight: 600; text-align: right;">NOT CONNECTED</span>
       </div>
 
       <div style="display: flex; gap: 6px; margin-top: 6px;">
-        <button id="hud-reload-btn" style="flex: 1; background: #15803d; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
+        <button id="hud-reload-btn" style="flex: 1; background: #15803d; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
           🔄 Restart
         </button>
-        <button id="hud-test-btn" style="flex: 1; background: #2563eb; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
+        <button id="hud-test-btn" style="flex: 1; background: #2563eb; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
           🔊 Test Audio
         </button>
-        <button id="hud-resume-btn" style="display: none; flex: 1; background: #ea580c; color: white; border: none; border-radius: 4px; padding: 4px 8px; font-size: 10px; cursor: pointer; font-weight: 600;">
+        <button id="hud-auth-btn" style="flex: 1.2; background: #7c3aed; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
+          🌐 Google Auth
+        </button>
+        <button id="hud-resume-btn" style="display: none; flex: 1; background: #ea580c; color: white; border: none; border-radius: 4px; padding: 4px 6px; font-size: 10px; cursor: pointer; font-weight: 600;">
           ▶ Start
         </button>
       </div>
@@ -262,7 +352,17 @@ function createLatencyHUD() {
   const resumeBtn = hud.querySelector('#hud-resume-btn');
   const reloadBtn = hud.querySelector('#hud-reload-btn');
   const testBtn = hud.querySelector('#hud-test-btn');
+  const authBtn = hud.querySelector('#hud-auth-btn');
   let isMinimized = false;
+
+  authBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    savedGoogleToken = null;
+    updateHUD();
+    ipcRenderer.invoke('clear-google-token');
+    console.log('[SynthHost] Initiating manual Google OAuth login in Chrome...');
+    ipcRenderer.invoke('open-browser-auth');
+  });
 
   window.__playTestTone = () => {
     if (!activeAudioContext) {
@@ -389,5 +489,19 @@ function updateHUD() {
     if (resumeBtn) resumeBtn.style.display = 'block';
   } else {
     if (resumeBtn) resumeBtn.style.display = 'none';
+  }
+
+  const elGoogle = document.getElementById('hud-google-status');
+  const authBtn = document.getElementById('hud-auth-btn');
+  if (elGoogle) {
+    if (savedGoogleToken) {
+      elGoogle.textContent = 'CONNECTED';
+      elGoogle.style.color = '#4ade80';
+      if (authBtn) authBtn.textContent = '🔄 Re-auth Google';
+    } else {
+      elGoogle.textContent = 'NOT CONNECTED';
+      elGoogle.style.color = '#facc15';
+      if (authBtn) authBtn.textContent = '🌐 Google Auth';
+    }
   }
 }
