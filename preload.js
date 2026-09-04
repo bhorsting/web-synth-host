@@ -23,24 +23,30 @@ ipcRenderer.invoke('get-asio-status').then(status => {
 
 // Restore persisted settings from disk before React mounts
 try {
-  const diskSettings = ipcRenderer.sendSync('get-saved-settings-sync');
-  if (diskSettings && (diskSettings.googleSheetUrl || diskSettings.googleDriveFolderId)) {
-    let current = {};
-    try {
-      current = JSON.parse(localStorage.getItem('synth_performance_settings') || '{}');
-    } catch (e) {}
-    
-    let needsUpdate = false;
-    for (const [k, v] of Object.entries(diskSettings)) {
-      if (v && (!current[k] || current[k] === '')) {
-        current[k] = v;
-        needsUpdate = true;
-      }
+  const diskSettings = ipcRenderer.sendSync('get-saved-settings-sync') || {};
+  let current = {};
+  try {
+    current = JSON.parse(localStorage.getItem('synth_performance_settings') || '{}');
+  } catch (e) {}
+  
+  let needsUpdate = false;
+  for (const [k, v] of Object.entries(diskSettings)) {
+    if (v !== undefined && v !== null && (current[k] === undefined || current[k] === '')) {
+      current[k] = v;
+      needsUpdate = true;
     }
-    if (needsUpdate) {
-      localStorage.setItem('synth_performance_settings', JSON.stringify(current));
-      console.log('[SynthHost] Restored persisted settings from disk to localStorage:', current.googleSheetUrl);
-    }
+  }
+
+  // Ensure enableSurround51 is enabled for multi-channel ASIO host (ESI Out 1/2 Synth, Out 5/6 Click)
+  const targetSurround = diskSettings.enableSurround51 !== undefined ? diskSettings.enableSurround51 : true;
+  if (current.enableSurround51 !== targetSurround) {
+    current.enableSurround51 = targetSurround;
+    needsUpdate = true;
+  }
+
+  if (needsUpdate) {
+    localStorage.setItem('synth_performance_settings', JSON.stringify(current));
+    console.log('[SynthHost] Restored persisted settings from disk to localStorage:', current);
   }
 } catch (e) {
   console.warn('[SynthHost] Could not preload settings from disk:', e);
@@ -291,6 +297,19 @@ if (OriginalAudioContext) {
       }
     }
     return origConnect.apply(this, arguments);
+  };
+
+  const origDisconnect = AudioNode.prototype.disconnect;
+  AudioNode.prototype.disconnect = function(destination) {
+    if (this._isAsioInternal) {
+      return origDisconnect.apply(this, arguments);
+    }
+    if (destination === this.context.destination && this.context._asioMasterBus) {
+      const args = Array.from(arguments);
+      args[0] = this.context._asioMasterBus;
+      return origDisconnect.apply(this, args);
+    }
+    return origDisconnect.apply(this, arguments);
   };
 }
 
