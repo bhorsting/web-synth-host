@@ -21,17 +21,18 @@ const workletCode = `
 class AsioTapProcessor extends AudioWorkletProcessor {
   process(inputs, outputs, parameters) {
     const input = inputs[0];
-    if (input && input.length >= 2) {
+    const len = (input && input[0] && input[0].length > 0) ? input[0].length : 128;
+    const interleaved = new Float32Array(len * 2);
+    if (input && input.length > 0 && input[0] && input[0].length > 0) {
       const left = input[0];
-      const right = input[1];
-      const len = left.length; // 128 samples per quantum
-      const interleaved = new Float32Array(len * 2);
+      const right = (input.length > 1 && input[1] && input[1].length === len) ? input[1] : left;
       for (let i = 0; i < len; i++) {
         interleaved[i * 2] = left[i];
         interleaved[i * 2 + 1] = right[i];
       }
-      this.port.postMessage(interleaved.buffer, [interleaved.buffer]);
     }
+    // Stream continuously: during idle/silence, interleaved contains 0.0f
+    this.port.postMessage(interleaved.buffer, [interleaved.buffer]);
     return true;
   }
 }
@@ -41,9 +42,11 @@ registerProcessor('asio-tap-processor', AsioTapProcessor);
 // Intercept AudioContext to attach the high-speed ASIO tap
 const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
 if (OriginalAudioContext) {
+  const origConnect = AudioNode.prototype.connect;
+
   window.AudioContext = class PatchedAudioContext extends OriginalAudioContext {
     constructor(options = {}) {
-      super({ ...options, latencyHint: 0 });
+      super({ ...options, latencyHint: 0, sampleRate: (options && options.sampleRate) ? options.sampleRate : 48000 });
       activeAudioContext = this;
       window.__activeAudioContext = this;
 
@@ -52,11 +55,11 @@ if (OriginalAudioContext) {
       // Master bus that receives all synth output
       this._asioMasterBus = this.createGain();
 
-      // Muted destination connection to prevent Chromium's 128ms WASAPI engine from playing audio
+      // Muted destination connection to keep WebAudio clock ticking
       const silentSink = this.createGain();
       silentSink.gain.value = 0.0;
-      this._asioMasterBus.connect(silentSink);
-      silentSink.connect(this.destination);
+      origConnect.call(this._asioMasterBus, silentSink);
+      origConnect.call(silentSink, this.destination);
 
       // Initialize AudioWorklet for low-latency Float32 capture
       const blob = new Blob([workletCode], { type: 'application/javascript' });
@@ -65,7 +68,8 @@ if (OriginalAudioContext) {
       this.audioWorklet.addModule(url).then(() => {
         URL.revokeObjectURL(url);
         this._asioTapNode = new AudioWorkletNode(this, 'asio-tap-processor');
-        this._asioMasterBus.connect(this._asioTapNode);
+        origConnect.call(this._asioMasterBus, this._asioTapNode);
+        origConnect.call(this._asioTapNode, silentSink);
 
         this._asioTapNode.port.onmessage = (e) => {
           // Stream raw 128-sample Float32 chunks directly to native ASIO driver
@@ -97,7 +101,6 @@ if (OriginalAudioContext) {
   window.webkitAudioContext = window.AudioContext;
 
   // Intercept all AudioNode.connect calls to redirect destination connections to our ASIO master bus
-  const origConnect = AudioNode.prototype.connect;
   AudioNode.prototype.connect = function(destination) {
     if (destination === this.context.destination && this.context._asioMasterBus) {
       const args = Array.from(arguments);
@@ -232,12 +235,15 @@ function updateHUD() {
   const resumeBtn = document.getElementById('hud-resume-btn');
 
   const sr = (activeAudioContext && activeAudioContext.sampleRate) ? activeAudioContext.sampleRate : 48000;
-  const quantumMs = 2.67; // 128 frames @ 48kHz
-  const hwMs = asioStatus.ready ? asioStatus.latencyMs : 1.33;
-  const totalMs = (quantumMs + hwMs).toFixed(2);
+  const quantumMs = (128 / sr * 1000); // 2.67ms @ 48kHz
+  const hwFrames = asioStatus.ready ? (asioStatus.latencySamples || 64) : 64;
+  const hwMs = (hwFrames / sr * 1000);
+  const cushionFrames = Math.max(256, hwFrames * 2);
+  const cushionMs = (cushionFrames / sr * 1000);
+  const totalMs = (quantumMs + cushionMs + hwMs).toFixed(2);
 
   if (elHwBuf) {
-    elHwBuf.textContent = `${asioStatus.latencySamples || 64} frames (${hwMs.toFixed(2)} ms)`;
+    elHwBuf.textContent = `${hwFrames} frames (${hwMs.toFixed(2)} ms)`;
   }
   if (elTotal) {
     elTotal.textContent = `${totalMs} ms`;
@@ -248,7 +254,7 @@ function updateHUD() {
   }
   if (elStatus) {
     if (asioStatus.ready) {
-      elStatus.textContent = `STREAMING (${asioStatus.latencySamples}s)`;
+      elStatus.textContent = `STREAMING (${hwFrames}s)`;
       elStatus.style.color = '#4ade80';
       if (elDot) elDot.style.background = '#22c55e';
     } else {

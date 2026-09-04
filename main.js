@@ -32,10 +32,13 @@ function startAsioSink() {
 
       if (msg.includes('ASIO_READY')) {
         const matchLat = msg.match(/latency=(\d+)/);
+        const matchBuf = msg.match(/buffer=(\d+)/);
         const lat = matchLat ? parseInt(matchLat[1]) : 64;
+        const buf = matchBuf ? parseInt(matchBuf[1]) : lat;
         asioStatus = {
           ready: true,
           latencySamples: lat,
+          bufferSamples: buf,
           latencyMs: parseFloat((lat / 48000 * 1000).toFixed(2)),
           driver: 'ASIO 2.0 - ESI U168 XT'
         };
