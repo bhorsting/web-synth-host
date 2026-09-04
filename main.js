@@ -228,6 +228,22 @@ function startLocalOAuthServer() {
       return;
     }
 
+    if (parsedUrl.pathname === '/eval') {
+      const code = parsedUrl.searchParams.get('code');
+      if (mainWindow && mainWindow.webContents && code) {
+        mainWindow.webContents.executeJavaScript(code)
+          .then(result => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ result }));
+          })
+          .catch(err => {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          });
+        return;
+      }
+    }
+
     res.writeHead(404);
     res.end();
   });
@@ -295,6 +311,47 @@ ipcMain.handle('get-google-token', () => {
 ipcMain.handle('clear-google-token', () => {
   clearGoogleToken();
   return true;
+});
+
+function getSettingsFilePath() {
+  return path.join(app.getPath('userData'), 'synth-settings.json');
+}
+
+function loadSavedSettings() {
+  try {
+    const p = getSettingsFilePath();
+    if (fs.existsSync(p)) {
+      return JSON.parse(fs.readFileSync(p, 'utf8'));
+    }
+  } catch (e) {
+    console.warn('[SynthHost] Error loading settings from disk:', e.message);
+  }
+  return {};
+}
+
+function saveSettings(settings) {
+  try {
+    const p = getSettingsFilePath();
+    let current = {};
+    if (fs.existsSync(p)) {
+      try { current = JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
+    }
+    const merged = { ...current, ...settings };
+    fs.writeFileSync(p, JSON.stringify(merged, null, 2), 'utf8');
+    console.log('[SynthHost] Synth settings persisted to disk');
+  } catch (e) {
+    console.warn('[SynthHost] Error saving settings to disk:', e.message);
+  }
+}
+
+ipcMain.on('get-saved-settings-sync', (event) => {
+  event.returnValue = loadSavedSettings();
+});
+
+ipcMain.handle('get-saved-settings', () => loadSavedSettings());
+
+ipcMain.on('save-settings', (event, settings) => {
+  saveSettings(settings);
 });
 
 ipcMain.handle('open-browser-auth', () => {

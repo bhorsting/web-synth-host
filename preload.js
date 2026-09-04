@@ -18,6 +18,49 @@ ipcRenderer.invoke('get-asio-status').then(status => {
 });
 
 // ============================================================================
+// SETTINGS PERSISTENCE (SHEET & DRIVE URLS DISK SYNC)
+// ============================================================================
+
+// Restore persisted settings from disk before React mounts
+try {
+  const diskSettings = ipcRenderer.sendSync('get-saved-settings-sync');
+  if (diskSettings && (diskSettings.googleSheetUrl || diskSettings.googleDriveFolderId)) {
+    let current = {};
+    try {
+      current = JSON.parse(localStorage.getItem('synth_performance_settings') || '{}');
+    } catch (e) {}
+    
+    let needsUpdate = false;
+    for (const [k, v] of Object.entries(diskSettings)) {
+      if (v && (!current[k] || current[k] === '')) {
+        current[k] = v;
+        needsUpdate = true;
+      }
+    }
+    if (needsUpdate) {
+      localStorage.setItem('synth_performance_settings', JSON.stringify(current));
+      console.log('[SynthHost] Restored persisted settings from disk to localStorage:', current.googleSheetUrl);
+    }
+  }
+} catch (e) {
+  console.warn('[SynthHost] Could not preload settings from disk:', e);
+}
+
+// Intercept localStorage.setItem to mirror all settings changes to disk
+try {
+  const origSetItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function(key, value) {
+    origSetItem.call(this, key, value);
+    if (key === 'synth_performance_settings') {
+      try {
+        const parsed = JSON.parse(value);
+        ipcRenderer.send('save-settings', parsed);
+      } catch (e) {}
+    }
+  };
+} catch (e) {}
+
+// ============================================================================
 // SYSTEM BROWSER GOOGLE OAUTH 2.0 BRIDGE
 // ============================================================================
 
@@ -53,50 +96,55 @@ ipcRenderer.on('google-token-received', (event, token) => {
 
 // Intercept Google Identity Services initTokenClient to use the system browser
 function hookGoogleIdentityServices() {
-  const checkInterval = setInterval(() => {
-    if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-      if (window.google.accounts.oauth2._isHooked) {
-        clearInterval(checkInterval);
-        return;
-      }
-      window.google.accounts.oauth2._isHooked = true;
-      clearInterval(checkInterval);
+  const myInitTokenClient = function(config) {
+    console.log('[SynthHost] Intercepted google.accounts.oauth2.initTokenClient call from web synth!');
 
-      const origInit = window.google.accounts.oauth2.initTokenClient;
-      window.google.accounts.oauth2.initTokenClient = function(config) {
-        console.log('[SynthHost] Intercepted google.accounts.oauth2.initTokenClient');
+    return {
+      requestAccessToken: function(opts) {
+        console.log('[SynthHost] requestAccessToken triggered by web synth');
 
-        return {
-          requestAccessToken: function(opts) {
-            console.log('[SynthHost] requestAccessToken triggered by web synth');
-
-            // If we already have a valid token saved, supply it immediately
-            if (savedGoogleToken) {
-              console.log('[SynthHost] Supplying active Google token to synth callback!');
-              if (config && typeof config.callback === 'function') {
-                setTimeout(() => {
-                  config.callback({
-                    access_token: savedGoogleToken,
-                    expires_in: 3600,
-                    token_type: 'Bearer',
-                    scope: config.scope || 'https://www.googleapis.com/auth/spreadsheets'
-                  });
-                }, 20);
-                return;
-              }
-            }
-
-            // Otherwise, open system browser for 1-click Google sign-in!
-            console.log('[SynthHost] Requesting OAuth authorization via system browser...');
-            currentGoogleAuthCallback = config ? config.callback : null;
-            ipcRenderer.invoke('open-browser-auth');
+        // If we already have a valid token saved, supply it immediately
+        if (savedGoogleToken) {
+          console.log('[SynthHost] Supplying active Google token directly to synth callback!');
+          if (config && typeof config.callback === 'function') {
+            setTimeout(() => {
+              config.callback({
+                access_token: savedGoogleToken,
+                expires_in: 3600,
+                token_type: 'Bearer',
+                scope: config.scope || 'https://www.googleapis.com/auth/spreadsheets'
+              });
+            }, 20);
+            return;
           }
-        };
-      };
+        }
 
-      console.log('[SynthHost] Google Identity Services successfully hooked for system browser OAuth!');
+        // Otherwise, open system browser for 1-click Google sign-in!
+        console.log('[SynthHost] Requesting OAuth authorization via system browser...');
+        currentGoogleAuthCallback = config ? config.callback : null;
+        ipcRenderer.invoke('open-browser-auth');
+      }
+    };
+  };
+
+  function enforceHook() {
+    try {
+      if (!window.google) window.google = {};
+      if (!window.google.accounts) window.google.accounts = {};
+      if (!window.google.accounts.oauth2) window.google.accounts.oauth2 = {};
+
+      if (window.google.accounts.oauth2.initTokenClient !== myInitTokenClient) {
+        window.google.accounts.oauth2.initTokenClient = myInitTokenClient;
+        console.log('[SynthHost] Enforced initTokenClient hook on window.google.accounts.oauth2');
+      }
+    } catch (e) {
+      console.warn('[SynthHost] Hook error:', e);
     }
-  }, 50);
+  }
+
+  // Continuously enforce so external scripts (e.g. gsi/client) can never clobber it
+  setInterval(enforceHook, 50);
+  enforceHook();
 }
 
 hookGoogleIdentityServices();
