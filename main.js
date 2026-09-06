@@ -24,7 +24,18 @@ let asioProcess = null;
 let asioStatus = { ready: false, latencySamples: 64, latencyMs: 1.33, driver: 'ASIO 2.0 - ESI U168 XT' };
 
 function startAsioSink() {
-  const asioExe = path.join(__dirname, 'asio-bridge', 'AsioSink.exe');
+  let asioExe = path.join(__dirname, 'asio-bridge', 'AsioSink.exe');
+  if (app.isPackaged) {
+    const unpackedExe = asioExe.replace('app.asar', 'app.asar.unpacked');
+    if (fs.existsSync(unpackedExe)) {
+      asioExe = unpackedExe;
+    } else {
+      const resourceExe = path.join(process.resourcesPath, 'asio-bridge', 'AsioSink.exe');
+      if (fs.existsSync(resourceExe)) {
+        asioExe = resourceExe;
+      }
+    }
+  }
   console.log('[SynthHost] Starting Native ASIO Bridge:', asioExe);
 
   try {
@@ -383,7 +394,8 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 600,
     fullscreen: true,
-    title: 'Roland Jupiter-8 Synth (Native ASIO - ESI U168XT)',
+    title: 'Jupiter Synthesizer',
+    icon: path.join(__dirname, 'build', 'icon.png'),
     backgroundColor: '#0a0a0f',
     show: true,
     webPreferences: {

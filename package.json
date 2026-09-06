@@ -1,10 +1,15 @@
 {
-  "name": "jupiter8-synth-host",
+  "name": "jupiter-synthesizer",
+  "productName": "Jupiter Synthesizer",
   "version": "1.0.0",
-  "description": "Ultra-low latency Electron host for Jupiter-8 Web Synth targeting ESI U168XT",
+  "description": "Jupiter-8 Synthesizer with Direct Native ASIO 2.0 and Multi-Channel Output",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build:dir": "electron-builder --win --dir",
+    "build:portable": "electron-builder --win portable",
+    "build:installer": "electron-builder --win nsis",
+    "build": "electron-builder --win"
   },
   "keywords": [
     "synth",
@@ -15,9 +20,40 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^44.2.0"
+    "electron": "^44.2.0",
+    "electron-builder": "^26.15.3"
   },
-  "dependencies": {
-    "audify": "^1.10.1"
+  "build": {
+    "appId": "com.jupiter8.synthhost",
+    "productName": "Jupiter Synthesizer",
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Jupiter Synthesizer"
+    },
+    "extraResources": [
+      {
+        "from": "asio-bridge",
+        "to": "asio-bridge",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "asio-bridge/**/*"
+    ],
+    "directories": {
+      "output": "dist"
+    }
   }
 }
