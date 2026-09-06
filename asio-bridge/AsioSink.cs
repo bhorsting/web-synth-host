@@ -1,5 +1,8 @@
 using System;
 using System.IO;
+using System.Diagnostics;
+using System.Threading;
+using System.Runtime.InteropServices;
 using NAudio.Wave;
 
 class CircularBuffer {
@@ -136,8 +139,46 @@ class AsioStreamProvider : IWaveProvider {
 }
 
 class Program {
+    [DllImport("avrt.dll", SetLastError = true)]
+    static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref int taskIndex);
+
+    [DllImport("avrt.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool AvRevertMmThreadCharacteristics(IntPtr avrtHandle);
+
     [STAThread]
     static void Main(string[] args) {
+        // Elevate process priority to RealTime (fallback to High)
+        try {
+            Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
+            Console.WriteLine("[ASIO Host] Process priority elevated to RealTime");
+        } catch {
+            try {
+                Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
+                Console.WriteLine("[ASIO Host] Process priority elevated to High");
+            } catch (Exception ex) {
+                Console.WriteLine("[ASIO Host] Process priority adjustment note: " + ex.Message);
+            }
+        }
+
+        // Elevate audio ingestion thread priority to Highest
+        try {
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            Console.WriteLine("[ASIO Host] Main audio thread priority set to Highest");
+        } catch {}
+
+        // Register thread with Windows MMCSS (Multimedia Class Scheduler Service) as "Pro Audio"
+        int taskIndex = 0;
+        IntPtr mmcssHandle = IntPtr.Zero;
+        try {
+            mmcssHandle = AvSetMmThreadCharacteristics("Pro Audio", ref taskIndex);
+            if (mmcssHandle != IntPtr.Zero) {
+                Console.WriteLine("[ASIO Host] Windows MMCSS 'Pro Audio' registered successfully (taskIndex=" + taskIndex + ")");
+            }
+        } catch (Exception ex) {
+            Console.WriteLine("[ASIO Host] Windows MMCSS registration note: " + ex.Message);
+        }
+
         int sampleRate = 48000;
         string driverName = "ASIO 2.0 - ESI U168 XT";
         if (args.Length > 0 && !string.IsNullOrEmpty(args[0])) {
@@ -207,6 +248,10 @@ class Program {
         } catch (Exception ex) {
             Console.Error.WriteLine("ASIO_ERROR: " + ex.Message);
             Console.Error.Flush();
+        } finally {
+            if (mmcssHandle != IntPtr.Zero) {
+                try { AvRevertMmThreadCharacteristics(mmcssHandle); } catch {}
+            }
         }
     }
 }

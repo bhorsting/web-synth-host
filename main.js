@@ -2,13 +2,48 @@ const { app, BrowserWindow, powerSaveBlocker, session, ipcMain, shell } = requir
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
+
+// ============================================================================
+// REAL-TIME PROCESS PRIORITY ELEVATION
+// ============================================================================
+
+function elevateProcessPriority(pid, label) {
+  if (!pid) return;
+  try {
+    // Windows: -20 corresponds to REALTIME_PRIORITY_CLASS
+    os.setPriority(pid, -20);
+    console.log(`[SynthHost] ${label} (PID ${pid}) priority elevated to REALTIME`);
+  } catch (err) {
+    try {
+      // Fallback: -14 corresponds to HIGH_PRIORITY_CLASS
+      os.setPriority(pid, -14);
+      console.log(`[SynthHost] ${label} (PID ${pid}) priority elevated to HIGH`);
+    } catch (err2) {
+      console.warn(`[SynthHost] Could not elevate ${label} (PID ${pid}) priority:`, err2.message);
+    }
+  }
+}
+
+// Elevate Electron Main process immediately
+elevateProcessPriority(process.pid, 'Electron Main Process');
 
 // ============================================================================
 // HARDWARE LOW-LATENCY CHROMIUM SWITCHES
 // ============================================================================
 
 app.commandLine.appendSwitch('high-priority-internal-threads');
+app.commandLine.appendSwitch('audio-process-high-priority');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('force-high-performance-gpu');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes');
+app.commandLine.appendSwitch('disable-low-end-device-mode');
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('disable-audio-output-resampler');
 app.commandLine.appendSwitch('enable-web-midi');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -43,6 +78,8 @@ function startAsioSink() {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true
     });
+
+    elevateProcessPriority(asioProcess.pid, 'Native ASIO Process');
 
     asioProcess.stdout.on('data', (chunk) => {
       const msg = chunk.toString();
@@ -435,13 +472,22 @@ function createWindow() {
     };
   });
 
-  powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
+  powerSaveId = powerSaveBlocker.start('prevent-display-sleep');
 
   console.log('[SynthHost] Loading Synth URL...');
   mainWindow.loadURL('https://jupiter-8-web-synth-693154064316.us-west1.run.app/');
 
   mainWindow.webContents.on('did-finish-load', () => {
     console.log('[SynthHost] Synth page loaded successfully!');
+    try {
+      const rendererPid = mainWindow.webContents.getOSProcessId();
+      if (rendererPid) {
+        elevateProcessPriority(rendererPid, 'Chromium Audio/Renderer Process');
+      }
+    } catch (e) {
+      console.warn('[SynthHost] Could not retrieve renderer process ID:', e.message);
+    }
+
     if (mainWindow && mainWindow.webContents) {
       mainWindow.webContents.send('asio-status-update', asioStatus);
     }
